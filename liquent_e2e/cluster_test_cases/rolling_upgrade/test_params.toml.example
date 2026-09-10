@@ -1,0 +1,17 @@
+# Rolling Upgrade Test Parameters
+# Edit this file to configure different upgrade scenarios,
+# then run: python render_config.py
+
+[source]
+bin_path = "../target/quick-release/v1.0.0/liquent_node"
+
+[genesis_contracts]
+repo = "https://github.com/liquentlabs/liquent_chain_core_contracts.git"
+ref = "liquent-testnet-v1.0.0"
+
+[hardforks]
+alphaTime = 0
+betaTime = 0
+# gammaTime is a Unix-seconds timestamp and must remain in the future until all
+# six nodes finish the rolling upgrade. Replace this example before running.
+gammaTime = 1893456000

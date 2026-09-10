@@ -1,0 +1,74 @@
+# 4 validators + 1 VFN devnet topology, all on one host.
+# Separate from docker-compose.yaml (single-node, mainnet). This file exists
+# only to validate the docker image end-to-end against cluster's genesis.
+#
+# Why network_mode: host on every service?
+#   cluster-generated genesis hard-codes validator addrs as 127.0.0.1:6180..6183,
+#   and discovery_method is "onchain". Bridge+NAT would make peers unreachable.
+#
+# Usage:
+#   ./render-cluster-config.sh
+#   docker compose -f docker-compose.cluster.yaml up -d
+#   docker compose -f docker-compose.cluster.yaml logs -f node1
+
+x-node-common: &node-common
+  image: ${LIQUENT_IMAGE:-liquentlabs/liquent_node}:${IMAGE_TAG:-local}
+  restart: unless-stopped
+  network_mode: host
+  environment:
+    RUST_BACKTRACE: "1"
+    RUST_LOG: ${RUST_LOG:-info}
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  stop_grace_period: 60s
+  stop_signal: SIGTERM
+  logging:
+    driver: json-file
+    options:
+      max-size: "100m"
+      max-file: "5"
+
+services:
+  node1:
+    <<: *node-common
+    container_name: liquent_node1
+    volumes:
+      - ./config/node1:/liquent/config:ro
+      - node1-data:/liquent/data
+
+  node2:
+    <<: *node-common
+    container_name: liquent_node2
+    volumes:
+      - ./config/node2:/liquent/config:ro
+      - node2-data:/liquent/data
+
+  node3:
+    <<: *node-common
+    container_name: liquent_node3
+    volumes:
+      - ./config/node3:/liquent/config:ro
+      - node3-data:/liquent/data
+
+  node4:
+    <<: *node-common
+    container_name: liquent_node4
+    volumes:
+      - ./config/node4:/liquent/config:ro
+      - node4-data:/liquent/data
+
+  vfn1:
+    <<: *node-common
+    container_name: liquent_vfn1
+    volumes:
+      - ./config/vfn1:/liquent/config:ro
+      - vfn1-data:/liquent/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  vfn1-data:

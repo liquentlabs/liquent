@@ -1,0 +1,119 @@
+# pfn_chain stress-test compose, parameterized for single OR parallel use.
+#
+# Required env (set by run.sh; you usually don't invoke compose directly):
+#   COMPOSE_PROJECT_NAME=pfn_stress[_<id>]   # namespaces containers/volumes/network
+#   CONFIG_DIR=./config[-<ID>]               # rendered per-node configs (path-rewritten)
+#
+# Optional:
+#   CLUSTER_CPUSET=0-7                       # pin all node services to a core range
+#                                            # (empty = unrestricted; default)
+#   RUST_LOG=info                            # node log level
+#
+# Topologies:
+#   chain  — bring up all 5 services (node1 vfn1 pfn1 pfn2 pfn3)
+#   simple — bring up only 3 (node1 vfn1 pfn1); pfn2/pfn3 services are
+#            defined here but not `up`'d. (No harm in having them defined;
+#            compose only starts services you select.)
+#
+# All services use `network_mode: host` because the genesis bakes peer
+# addresses as 127.0.0.1:<port>; bridge networking would break peer dialing.
+# Per-cluster port offset (baked into the rendered config) keeps parallel
+# clusters disjoint.
+
+x-node-common: &node-common
+  image: liquent_node:pfn-stress
+  build:
+    context: ../..
+    # Wraps the host's pre-built target/quick-release/liquent_node into a
+    # runtime image. run.sh does `cargo build` on the host before invoking
+    # this — no in-container Rust compile (in-container builds chronically
+    # hit SSL/cargo-git issues; not worth the 30-60 min cost).
+    dockerfile: docker/liquent_node/Dockerfile
+    target: runtime-host-binary
+  restart: unless-stopped
+  network_mode: host
+  # cpuset pins all nodes of this cluster to a fixed core range. Empty
+  # string = unrestricted (docker default).
+  cpuset: ${CLUSTER_CPUSET:-}
+  environment:
+    RUST_BACKTRACE: "1"
+    RUST_LOG: ${RUST_LOG:-info}
+    LIQUENT_CONFIG_DIR: /liquent/config
+    LIQUENT_DATA_DIR: /liquent/data
+  ulimits:
+    nofile:
+      soft: 1048576
+      hard: 1048576
+  stop_grace_period: 60s
+  stop_signal: SIGTERM
+  logging:
+    driver: json-file
+    options:
+      max-size: "100m"
+      max-file: "5"
+
+services:
+  node1:
+    <<: *node-common
+    volumes:
+      - ${CONFIG_DIR:-./config}/node1:/liquent/config:ro
+      - node1-data:/liquent/data
+
+  vfn1:
+    <<: *node-common
+    volumes:
+      - ${CONFIG_DIR:-./config}/vfn1:/liquent/config:ro
+      - vfn1-data:/liquent/data
+
+  pfn1:
+    <<: *node-common
+    volumes:
+      - ${CONFIG_DIR:-./config}/pfn1:/liquent/config:ro
+      - pfn1-data:/liquent/data
+
+  # pfn2 / pfn3 — only used in `--topology=chain` (5-node). Under
+  # `--topology=simple`, run.sh starts only node1+vfn1+pfn1 and the configs
+  # for pfn2/pfn3 aren't rendered at all, so these services are silently
+  # ignored (compose won't try to start a service you didn't list in `up`).
+  pfn2:
+    <<: *node-common
+    volumes:
+      - ${CONFIG_DIR:-./config}/pfn2:/liquent/config:ro
+      - pfn2-data:/liquent/data
+
+  pfn3:
+    <<: *node-common
+    volumes:
+      - ${CONFIG_DIR:-./config}/pfn3:/liquent/config:ro
+      - pfn3-data:/liquent/data
+
+  bench:
+    profiles: ["bench"]
+    image: liquent_bench:pfn-stress
+    build:
+      context: ../../external/liquent_bench
+      dockerfile: Dockerfile
+    network_mode: host
+    environment:
+      RUST_BACKTRACE: "1"
+      RUST_LOG: ${RUST_LOG_BENCH:-info}
+    volumes:
+      - ${BENCH_DIR:-./bench}:/tmp/bench
+    working_dir: /tmp
+    # liquent_bench has no subcommands — main always calls start_bench().
+    # WORKDIR=/tmp in the image, where scripts/ and contracts/ live for
+    # the `python scripts/deploy.py` faucet phase. Keep CWD=/tmp.
+    entrypoint: ["./liquent_bench"]
+    command: ["--config", "/tmp/bench/bench.toml"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+volumes:
+  node1-data:
+  vfn1-data:
+  pfn1-data:
+  pfn2-data:
+  pfn3-data:

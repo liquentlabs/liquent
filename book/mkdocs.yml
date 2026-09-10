@@ -1,0 +1,13 @@
+site_name: LiquentSDKBook
+theme:
+  name: mkdocs
+  language: zh
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+
+nav:
+  - main: index.md

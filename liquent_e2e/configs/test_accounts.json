@@ -1,0 +1,7 @@
+{
+  "faucet": {
+    "address": "0x0000000000000000000000000000000000000000",
+    "private_key": "0x0000000000000000000000000000000000000000000000000000000000000001",
+    "description": "Faucet account with pre-funded balance for testing (REPLACE WITH ACTUAL KEYS IN LOCAL CONFIG)"
+  }
+}

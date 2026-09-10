@@ -1,0 +1,68 @@
+# [monitoring] is optional. Omit the entire section to run in probes-only mode.
+[monitoring]
+# Match all .log files in the logs directory
+file_patterns = ["logs/*.log", "test.log"]
+# Only monitor files modified in the last 24 hours (86400 seconds)
+recent_file_threshold_seconds = 86400
+# Regex to identify error lines
+error_pattern = "(?i)error|panic|fatal"
+# Path to whitelist CSV file (optional)
+# Format: "Pattern",Threshold
+#   -1 = always ignore
+#   >0 = alert if count >threshold in 5 minutes
+whitelist_path = "whitelist.csv"
+# Periodic interval (ms) to re-scan file_patterns for new log files.
+# If omitted, only the initial set of files is monitored.
+check_interval_ms = 2000
+
+[alerting]
+# Priority assigned to errors that do not match any whitelist rules (default: "p0")
+default_priority = "p2"
+
+# Default webhooks (fallback for priorities without specific overrides)
+feishu_webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/default..."
+slack_webhook = "https://hooks.slack.com/services/default..."
+# Minimum interval between alerts per priority (seconds)
+min_alert_interval = 5
+
+# Per-priority webhook overrides (optional)
+# If a priority has no override, the default webhooks above are used.
+[alerting.priorities.p0]
+feishu_webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/critical-group..."
+
+[alerting.priorities.p1]
+feishu_webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/ops-group..."
+
+[alerting.priorities.p2]
+feishu_webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/general-group..."
+
+# Probe endpoints (optional, can define multiple)
+# Each probe independently tracks failure count for its URL.
+[[probes]]
+# Probe reth node health via JSON-RPC eth_blockNumber
+url = "http://localhost:8545"
+tag = "Validator-0 RPC Node"
+check_interval_seconds = 10
+failure_threshold = 3
+
+[[probes]]
+url = "http://localhost:8546"
+tag = "VFN-0 RPC Node"
+# check_interval_seconds defaults to 30
+# failure_threshold defaults to 3
+
+# Explorer block-advance monitor (optional).
+# Polls Blockscout v2 /api/v2/stats and alerts when total_blocks does not
+# advance within the poll window (i.e. any block interval > poll_interval_seconds).
+[explorer_monitor]
+api_base = "https://api.explorer-testnet.liquent.xyz"
+tag = "explorer-testnet"
+# Poll cadence in seconds; doubles as the stall threshold.
+# Default: 1
+poll_interval_seconds = 1
+# Priority for stall alerts (API failures always escalate to P0).
+# Default: "p1"
+priority = "p1"
+# Consecutive API failures before emitting a single P0 degraded alert.
+# Default: 5
+api_failure_threshold = 5

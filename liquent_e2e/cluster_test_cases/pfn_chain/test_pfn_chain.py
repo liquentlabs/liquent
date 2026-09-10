@@ -1,0 +1,990 @@
+"""
+PFN Fan-out + Redundant Leaf Topology Test
+
+Topology:
+                      +--- pfn1 <----+
+                      |              |
+   node1 <-Vfn- vfn1--+              +--- pfn3
+                      |              |
+                      +--- pfn2 <----+
+
+pfn1 / pfn2 are sibling PFNs (each independently dials vfn1 on Public).
+pfn3 is the leaf with TWO redundant upstreams (dials both pfn1 and pfn2).
+pfn1 / pfn2 each register pfn3 as a Downstream peer (trusted_peers entry,
+no active dial — Downstream is excluded from upstream_roles for Public;
+see network_id.rs:173-188).
+
+What this test verifies:
+1. PFN-as-upstream-for-PFN sync (pfn3's only upstreams are PFNs).
+2. Role auto-inference branch `from = "<pfn>"` (deploy.sh:189).
+3. Explicit Downstream-role seed entries on pfn1/pfn2.
+4. Tx forwarding from PFN's RPC end-to-end: tx submitted via pfn3's
+   eth_sendRawTransaction must propagate pfn3 -> (pfn1 or pfn2) -> vfn1
+   -> node1 (mempool broadcast on Public network) and land in a block.
+5. Redundant-upstream failover under load: Phase 1 stops pfn1 then pfn2
+   in sequence (never both at the same time, only when steady), pfn3
+   must keep producing receipts via the surviving upstream.
+
+See _local/drafts/pfn/pfn-chain-test-plan.md for the full design rationale,
+including §10's analysis of why we expect confirms to drop during stop
+windows (liquent's mempool override defeats upstream's multi-peer broadcast).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import math
+import pathlib
+import statistics
+import time
+from dataclasses import dataclass
+
+import pytest
+from eth_account import Account
+from web3 import Web3
+
+from liquent_e2e.cluster.manager import Cluster
+from liquent_e2e.cluster.node import Node
+
+LOG = logging.getLogger(__name__)
+
+MAX_HEIGHT_GAP = 50              # runtime tolerance — absorbs transient spikes
+STEADY_GAP_THRESHOLD = 10        # tighter — used to gate "ok to stop a node"
+STEADY_WINDOW = 3                # consecutive samples meeting threshold
+STEADY_POLL_INTERVAL = 5         # seconds between steady-check samples
+MONITOR_INTERVAL = 10            # seconds between general height samples
+TX_INTERVAL = 0.2                # ~5 tx/s
+TX_RECEIPT_TIMEOUT = 30.0
+PFN_FORWARD_RECEIPT_TIMEOUT = 60.0   # Phase 0 / post-restart probe budget
+PFN_DOWN_DURATION = 30           # seconds each PFN stays stopped
+CATCHUP_TIMEOUT = PFN_DOWN_DURATION * 4   # 120s budget per plan §7.4
+POST_TAIL_DURATION = 60          # final monitor window after Phase 1b
+STEADY_INITIAL_TIMEOUT = 60      # max wait for first steady before any stops
+# After STOP sibling A, ConnectivityManager re-dials A with exponential
+# backoff capped at max_connection_delay_ms (Public default 60s). Height
+# steady after A's restart only proves the *other* upstream still feeds
+# pfn3 — not that pfn3↔A is back. Before STOP sibling B, wait until wall
+# time since A's stop is at least this long so the re-dial cliff can clear.
+# = 60s cap + 5s connectivity_check_interval (no peer-table probe in e2e yet).
+# See _local/tmp/pfn3-topology-stall-analysis.md H1.
+UPSTREAM_REDIAL_SETTLE_SECS = 65
+# No absolute confirm-count threshold: TxSender's loop ensures
+# `total_sent == total_confirmed + total_timeout` after stop(), so the
+# meaningful health check is "did anything actually fail" — see Phase 1
+# assertions at the end of the test.
+NODE_IDS = ("node1", "vfn1", "pfn1", "pfn2", "pfn3")
+
+
+@dataclass
+class TxSnap:
+    sent: int
+    confirmed: int
+    timeout: int
+    failed: int
+
+    def __sub__(self, other: "TxSnap") -> "TxSnap":
+        return TxSnap(
+            sent=self.sent - other.sent,
+            confirmed=self.confirmed - other.confirmed,
+            timeout=self.timeout - other.timeout,
+            failed=self.failed - other.failed,
+        )
+
+    def __str__(self) -> str:
+        return (
+            f"sent={self.sent} confirmed={self.confirmed} "
+            f"timeout={self.timeout} failed={self.failed}"
+        )
+
+
+class MultiAccountTxSender:
+    """
+    Continuously fan out txs from a *pool of pre-funded accounts* to a target
+    node, one tx per loop iteration round-robin. Used by Phase 3 to spread
+    senders across all 4 sender_buckets — the impl-d slot-flip path only
+    triggers for buckets whose Primary is the blackhole peer, so we need at
+    least a few txs hitting each bucket so the SLA assertion exercises a
+    mix of direct and slot-flip latencies in one run.
+
+    Note: each account here uses its own nonce sequence, so we don't have to
+    worry about head-of-line stalls from a single faucet's pending queue.
+    """
+
+    def __init__(
+        self,
+        cluster: "Cluster",
+        accounts: list,
+        target_node_id: str,
+        tx_interval: float = 0.2,
+    ):
+        self.cluster = cluster
+        self.accounts = accounts
+        self.target_node_id = target_node_id
+        self.tx_interval = tx_interval
+        self.recipient = Account.create().address
+
+        self._stop_event = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        # Fire-and-forget receipt-waiter tasks; awaited in stop().
+        self._receipt_tasks: list[asyncio.Task] = []
+
+        self.total_sent = 0
+        self.total_confirmed = 0
+        self.total_failed = 0
+        self.total_timeout = 0
+        # Tuples of (sender_addr, latency_secs) so we can group by sender
+        # (≈ by bucket, since bucket = last_byte(sender) % num_buckets).
+        self.latencies: list[tuple[str, float]] = []
+
+    @property
+    def _w3(self) -> Web3:
+        return self.cluster.get_node(self.target_node_id).w3
+
+    def snapshot(self) -> "TxSnap":
+        return TxSnap(
+            sent=self.total_sent,
+            confirmed=self.total_confirmed,
+            timeout=self.total_timeout,
+            failed=self.total_failed,
+        )
+
+    async def _wait_receipt(self, addr: str, tx_hash, send_time: float):
+        """Fire-and-forget: poll receipt for one tx and bookkeep on resolution."""
+        w3 = self._w3
+        while time.monotonic() - send_time < TX_RECEIPT_TIMEOUT:
+            try:
+                receipt = await asyncio.to_thread(
+                    lambda: w3.eth.get_transaction_receipt(tx_hash)
+                )
+                if receipt:
+                    lat = time.monotonic() - send_time
+                    self.latencies.append((addr, lat))
+                    self.total_confirmed += 1
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+        self.total_timeout += 1
+        try:
+            short = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+        except Exception:
+            short = str(tx_hash)
+        LOG.warning(f"[multi-tx] TIMEOUT acc={addr[:10]}... hash=0x{short}")
+
+    async def _send_loop(self):
+        w3 = self._w3
+        chain_id = await asyncio.to_thread(lambda: w3.eth.chain_id)
+        gas_price = Web3.to_wei("100", "gwei")
+        # Per-account nonce cache to avoid an RPC roundtrip per tx.
+        nonces: dict[str, int] = {}
+        for acc in self.accounts:
+            nonces[acc.address] = await asyncio.to_thread(
+                lambda a=acc: w3.eth.get_transaction_count(a.address, "pending")
+            )
+        LOG.info(
+            f"MultiAccountTxSender started: target={self.target_node_id}, "
+            f"accounts={len(self.accounts)}"
+        )
+
+        idx = 0
+        while not self._stop_event.is_set():
+            w3 = self._w3
+            acc = self.accounts[idx % len(self.accounts)]
+            idx += 1
+            tx = {
+                "nonce": nonces[acc.address],
+                "to": self.recipient,
+                "value": 0,
+                "gas": 21000,
+                "gasPrice": gas_price,
+                "chainId": chain_id,
+            }
+            try:
+                signed = w3.eth.account.sign_transaction(tx, acc.key)
+                send_time = time.monotonic()
+                tx_hash = await asyncio.to_thread(
+                    lambda: w3.eth.send_raw_transaction(signed.raw_transaction)
+                )
+                self.total_sent += 1
+                nonces[acc.address] += 1
+                # Fire-and-forget receipt watcher: decouples send rate from
+                # per-tx commit latency. Necessary for Phase 3 where blackhole
+                # txs take ~6.5s to flip via Failover slot.
+                self._receipt_tasks.append(
+                    asyncio.create_task(
+                        self._wait_receipt(acc.address, tx_hash, send_time)
+                    )
+                )
+            except Exception as e:
+                self.total_failed += 1
+                LOG.warning(
+                    f"MultiAccountTxSender send failed ({self.target_node_id}): {e}"
+                )
+                await asyncio.sleep(1)
+                # Refresh nonce on failure — chain pending may have advanced.
+                try:
+                    nonces[acc.address] = await asyncio.to_thread(
+                        lambda a=acc: self._w3.eth.get_transaction_count(
+                            a.address, "pending"
+                        )
+                    )
+                except Exception:
+                    pass
+                continue
+            await asyncio.sleep(self.tx_interval)
+
+    def start(self):
+        self._task = asyncio.create_task(self._send_loop())
+
+    async def stop(self):
+        """Stop the send loop AND drain in-flight receipt watchers."""
+        self._stop_event.set()
+        if self._task:
+            await self._task
+        if self._receipt_tasks:
+            LOG.info(
+                f"MultiAccountTxSender: draining {len(self._receipt_tasks)} "
+                f"in-flight receipt watchers (≤{TX_RECEIPT_TIMEOUT}s)"
+            )
+            await asyncio.gather(*self._receipt_tasks, return_exceptions=True)
+
+    def latency_pct(self, p: float) -> float:
+        if not self.latencies:
+            return 0.0
+        sl = sorted(l for _, l in self.latencies)
+        k = (len(sl) - 1) * (p / 100.0)
+        f, c = math.floor(k), math.ceil(k)
+        return sl[int(k)] if f == c else sl[f] + (sl[c] - sl[f]) * (k - f)
+
+
+class TxSender:
+    """Continuously send txs to a target node; track submit/confirm stats."""
+
+    def __init__(self, cluster: Cluster, faucet, target_node_id: str):
+        self.cluster = cluster
+        self.faucet = faucet
+        self.target_node_id = target_node_id
+        self.recipient = Account.create().address
+
+        self._stop_event = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+        self.total_sent = 0
+        self.total_confirmed = 0
+        self.total_failed = 0
+        self.total_timeout = 0
+        self.latencies: list[float] = []
+        # Per-tx tracking for post-mortem hash correlation against node logs.
+        self.sent_hashes: list[str] = []
+        self.confirmed_hashes: set[str] = set()
+        self.timeout_hashes: list[str] = []
+
+    @property
+    def in_flight_hashes(self) -> list[str]:
+        """Hashes that have been sent but not yet confirmed or timed out."""
+        return [h for h in self.sent_hashes
+                if h not in self.confirmed_hashes
+                and h not in self.timeout_hashes]
+
+    @property
+    def _w3(self) -> Web3:
+        return self.cluster.get_node(self.target_node_id).w3
+
+    def snapshot(self) -> TxSnap:
+        return TxSnap(
+            sent=self.total_sent,
+            confirmed=self.total_confirmed,
+            timeout=self.total_timeout,
+            failed=self.total_failed,
+        )
+
+    async def _send_loop(self):
+        w3 = self._w3
+        chain_id = await asyncio.to_thread(lambda: w3.eth.chain_id)
+        gas_price = Web3.to_wei("100", "gwei")
+        nonce = await asyncio.to_thread(
+            lambda: w3.eth.get_transaction_count(self.faucet.address, "pending")
+        )
+        LOG.info(
+            f"TxSender started: target={self.target_node_id}, nonce={nonce}, "
+            f"recipient={self.recipient}"
+        )
+
+        while not self._stop_event.is_set():
+            w3 = self._w3
+            tx = {
+                "nonce": nonce,
+                "to": self.recipient,
+                "value": 0,
+                "gas": 21000,
+                "gasPrice": gas_price,
+                "chainId": chain_id,
+            }
+            try:
+                signed = w3.eth.account.sign_transaction(tx, self.faucet.key)
+                send_time = time.monotonic()
+                tx_hash = await asyncio.to_thread(
+                    lambda: w3.eth.send_raw_transaction(signed.raw_transaction)
+                )
+                tx_hash_hex = tx_hash.hex()
+                self.total_sent += 1
+                self.sent_hashes.append(tx_hash_hex)
+                nonce += 1
+
+                confirmed = False
+                while time.monotonic() - send_time < TX_RECEIPT_TIMEOUT:
+                    try:
+                        receipt = await asyncio.to_thread(
+                            lambda: w3.eth.get_transaction_receipt(tx_hash)
+                        )
+                        if receipt:
+                            self.latencies.append(time.monotonic() - send_time)
+                            self.total_confirmed += 1
+                            self.confirmed_hashes.add(tx_hash_hex)
+                            confirmed = True
+                            break
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.1)
+
+                if not confirmed:
+                    self.total_timeout += 1
+                    self.timeout_hashes.append(tx_hash_hex)
+                    LOG.warning(f"[txsender] TIMEOUT tx_hash=0x{tx_hash_hex}")
+                    try:
+                        nonce = await asyncio.to_thread(
+                            lambda: self._w3.eth.get_transaction_count(
+                                self.faucet.address, "pending"
+                            )
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                self.total_failed += 1
+                LOG.warning(f"TxSender send failed ({self.target_node_id}): {e}")
+                await asyncio.sleep(1)
+                try:
+                    nonce = await asyncio.to_thread(
+                        lambda: self._w3.eth.get_transaction_count(
+                            self.faucet.address, "pending"
+                        )
+                    )
+                except Exception:
+                    pass
+                continue
+
+            await asyncio.sleep(TX_INTERVAL)
+
+    def start(self):
+        self._task = asyncio.create_task(self._send_loop())
+
+    async def stop(self):
+        self._stop_event.set()
+        if self._task:
+            await self._task
+
+    def log_stats(self):
+        LOG.info("=" * 60)
+        LOG.info("TRANSACTION STATISTICS")
+        LOG.info("=" * 60)
+        LOG.info(f"Total Sent:    {self.total_sent}")
+        LOG.info(f"Confirmed:     {self.total_confirmed}")
+        LOG.info(f"Failed (send): {self.total_failed}")
+        LOG.info(f"Timed Out:     {self.total_timeout}")
+        if self.total_sent > 0:
+            LOG.info(
+                f"Success Rate:  {self.total_confirmed / self.total_sent * 100:.1f}%"
+            )
+        if self.latencies:
+            sl = sorted(self.latencies)
+
+            def pct(p):
+                k = (len(sl) - 1) * (p / 100.0)
+                f, c = math.floor(k), math.ceil(k)
+                return sl[int(k)] if f == c else sl[f] + (sl[c] - sl[f]) * (k - f)
+
+            LOG.info(f"Latency p50/p90/p99: {pct(50):.3f}s / {pct(90):.3f}s / {pct(99):.3f}s")
+            LOG.info(f"Latency min/max/avg: {sl[0]:.3f}s / {sl[-1]:.3f}s / {statistics.mean(sl):.3f}s")
+        LOG.info("=" * 60)
+
+
+async def _safe_block_number(node: Node) -> int | None:
+    """Fetch a node's block number; return None on RPC failure (node down / blip)."""
+    try:
+        return await asyncio.to_thread(lambda: node.w3.eth.block_number)
+    except Exception:
+        return None
+
+
+async def _get_live_heights(
+    cluster: Cluster, excluded: set[str]
+) -> dict[str, int]:
+    """
+    Fetch heights from all nodes not in `excluded`. RPC blips on a "live" node
+    are silently dropped from this round (logged as WARN), not raised.
+    """
+    live_ids = [nid for nid in NODE_IDS if nid not in excluded]
+    nodes = [cluster.get_node(nid) for nid in live_ids]
+    results = await asyncio.gather(*[_safe_block_number(n) for n in nodes])
+    out: dict[str, int] = {}
+    for nid, h in zip(live_ids, results):
+        if h is None:
+            LOG.warning(f"[heights] {nid} RPC unreachable this round, skipping")
+        else:
+            out[nid] = h
+    return out
+
+
+def _node_log_text(node: Node) -> str:
+    """Read consensus log (vfn.log for VFN/PFN, validator.log for validator)."""
+    base = pathlib.Path(node._infra_path) / "consensus_log"
+    for name in ("vfn.log", "validator.log"):
+        p = base / name
+        if p.exists():
+            return p.read_text(errors="replace")
+    return ""
+
+
+async def _wait_steady(
+    cluster: Cluster,
+    excluded: set[str],
+    timeout: float,
+    label: str,
+) -> bool:
+    """
+    Wait until live nodes are in steady state: STEADY_WINDOW consecutive
+    samples where (a) live gap < STEADY_GAP_THRESHOLD and (b) every live
+    node's height advanced from the previous sample.
+
+    Returns True if reached, False if timeout.
+    """
+    deadline = time.monotonic() + timeout
+    consecutive = 0
+    last_heights: dict[str, int] = {}
+
+    while time.monotonic() < deadline:
+        heights = await _get_live_heights(cluster, excluded)
+        if len(heights) < 2:
+            LOG.info(f"[{label}] only {len(heights)} live node(s); skipping gap check")
+            await asyncio.sleep(STEADY_POLL_INTERVAL)
+            continue
+
+        gap = max(heights.values()) - min(heights.values())
+        all_advanced = all(
+            nid in last_heights and heights[nid] > last_heights[nid]
+            for nid in heights
+        ) if last_heights else False
+        steady = gap < STEADY_GAP_THRESHOLD and all_advanced
+
+        LOG.info(
+            f"[{label}] heights={heights} gap={gap} "
+            f"advanced={all_advanced} consecutive={consecutive}/{STEADY_WINDOW}"
+        )
+        consecutive = consecutive + 1 if steady else 0
+        last_heights = heights
+
+        if consecutive >= STEADY_WINDOW:
+            return True
+        await asyncio.sleep(STEADY_POLL_INTERVAL)
+
+    return False
+
+
+async def _monitor_window(
+    cluster: Cluster,
+    excluded: set[str],
+    duration: float,
+    label: str,
+):
+    """
+    Sample heights every MONITOR_INTERVAL seconds for `duration` seconds.
+    Asserts gap < MAX_HEIGHT_GAP among live nodes; advancement is logged
+    but not asserted (a victim's restart may make catchup look stalled
+    briefly even with the loose threshold).
+    """
+    end = time.monotonic() + duration
+    while time.monotonic() < end:
+        await asyncio.sleep(MONITOR_INTERVAL)
+        heights = await _get_live_heights(cluster, excluded)
+        if len(heights) < 2:
+            LOG.info(f"[{label}] only {len(heights)} live; skipping gap")
+            continue
+        gap = max(heights.values()) - min(heights.values())
+        LOG.info(f"[{label}] heights={heights} gap={gap}")
+        assert gap < MAX_HEIGHT_GAP, (
+            f"[{label}] gap {gap} >= {MAX_HEIGHT_GAP}: {heights}"
+        )
+
+
+async def _send_tx_via_pfn_and_assert_inclusion(
+    cluster: Cluster, sender_node_id: str
+) -> tuple[str, int]:
+    """
+    Submit one self-funded eth tx to `sender_node_id`'s RPC, wait for receipt,
+    assert it landed in a block, AND assert validator (node1) sees the same
+    tx at the same block. Strongest single-shot proof of end-to-end forwarding.
+    """
+    pfn = cluster.get_node(sender_node_id)
+    validator = cluster.get_node("node1")
+    faucet = cluster.faucet
+
+    w3 = pfn.w3
+    chain_id = await asyncio.to_thread(lambda: w3.eth.chain_id)
+    gas_price = Web3.to_wei("100", "gwei")
+    nonce = await asyncio.to_thread(
+        lambda: w3.eth.get_transaction_count(faucet.address, "pending")
+    )
+
+    recipient = Account.create().address
+    tx = {
+        "nonce": nonce,
+        "to": recipient,
+        "value": Web3.to_wei("0.001", "ether"),
+        "gas": 21000,
+        "gasPrice": gas_price,
+        "chainId": chain_id,
+    }
+    signed = w3.eth.account.sign_transaction(tx, faucet.key)
+
+    LOG.info(f"[probe] submitting tx via {sender_node_id} (nonce={nonce})")
+    send_time = time.monotonic()
+    tx_hash = await asyncio.to_thread(
+        lambda: w3.eth.send_raw_transaction(signed.raw_transaction)
+    )
+    LOG.info(f"[probe] {sender_node_id} accepted tx_hash={tx_hash.hex()}")
+
+    receipt = None
+    while time.monotonic() - send_time < PFN_FORWARD_RECEIPT_TIMEOUT:
+        try:
+            receipt = await asyncio.to_thread(
+                lambda: w3.eth.get_transaction_receipt(tx_hash)
+            )
+            if receipt:
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    assert receipt is not None, (
+        f"tx submitted via {sender_node_id} did not get a receipt within "
+        f"{PFN_FORWARD_RECEIPT_TIMEOUT}s — broadcast didn't reach validator"
+    )
+    assert receipt["status"] == 1, f"tx failed on-chain: {receipt}"
+    block_number = receipt["blockNumber"]
+    assert block_number is not None and block_number > 0, (
+        f"tx receipt has no valid blockNumber: {receipt}"
+    )
+    LOG.info(
+        f"[probe] tx included in block #{block_number} after "
+        f"{time.monotonic() - send_time:.2f}s via {sender_node_id}"
+    )
+
+    validator_receipt = await asyncio.to_thread(
+        lambda: validator.w3.eth.get_transaction_receipt(tx_hash)
+    )
+    assert validator_receipt is not None, (
+        f"validator does not see tx {tx_hash.hex()} — propagation broken"
+    )
+    assert validator_receipt["blockNumber"] == block_number, (
+        f"validator block mismatch: pfn={block_number} "
+        f"validator={validator_receipt['blockNumber']}"
+    )
+    LOG.info(f"[probe] validator confirms inclusion at block #{block_number}")
+
+    return tx_hash.hex(), block_number
+
+
+@pytest.mark.asyncio
+async def test_pfn_chain_topology(cluster: Cluster):
+    """PFN fan-out + redundant leaf: see module docstring."""
+    LOG.info("=" * 70)
+    LOG.info("Test: PFN fan-out + redundant leaf (5 nodes)")
+    LOG.info("=" * 70)
+
+    assert await cluster.set_full_live(timeout=120), "Cluster failed to become live"
+
+    for nid in NODE_IDS:
+        assert cluster.get_node(nid) is not None, f"{nid} missing from cluster"
+
+    assert await cluster.check_block_increasing(timeout=30), "Blocks not advancing"
+
+    initial = await _get_live_heights(cluster, set())
+    LOG.info(f"initial heights: {initial}")
+
+    # Phase 0 — single-tx probe via pfn3 with validator cross-check.
+    LOG.info("[phase 0] probing pfn3 RPC -> validator inclusion path")
+    await _send_tx_via_pfn_and_assert_inclusion(cluster, sender_node_id="pfn3")
+
+    # Phase 1 — steady-state load + fixed-order pfn1/pfn2 stop cycles.
+    tx_sender = TxSender(cluster, cluster.faucet, target_node_id="pfn3")
+    tx_sender.start()
+    LOG.info("TxSender started against pfn3 (drives load through full topology)")
+
+    excluded: set[str] = set()
+    window_log: list[tuple[str, TxSnap]] = []  # (label, delta) per window
+
+    try:
+        # Phase 1a — wait for cluster to reach steady state before any stops.
+        snap_test_start = tx_sender.snapshot()
+        LOG.info("[phase 1a] waiting for steady state before first stop")
+        ok = await _wait_steady(
+            cluster, excluded, timeout=STEADY_INITIAL_TIMEOUT, label="phase1a-steady"
+        )
+        assert ok, (
+            f"Cluster did not reach steady state within {STEADY_INITIAL_TIMEOUT}s "
+            f"of starting TxSender — refusing to begin stop cycles"
+        )
+        snap_after_warmup = tx_sender.snapshot()
+        window_log.append(("Phase 1a (warmup)", snap_after_warmup - snap_test_start))
+
+        # Phase 1b — fixed order: stop pfn1, restart, then stop pfn2, restart.
+        for victim_id in ("pfn1", "pfn2"):
+            victim = cluster.get_node(victim_id)
+
+            pre_stop_heights = await _get_live_heights(cluster, excluded)
+            pre_stop_snap = tx_sender.snapshot()
+            in_flight_at_stop = list(tx_sender.in_flight_hashes)
+            LOG.info(
+                f"[phase 1b] STOP {victim_id} — pre_stop_heights={pre_stop_heights} "
+                f"in_flight_hashes={in_flight_at_stop}"
+            )
+
+            stop_mono = time.monotonic()
+            assert await victim.stop(), f"{victim_id} failed to stop"
+            excluded.add(victim_id)
+
+            # Down window: monitor remaining 4 nodes for PFN_DOWN_DURATION.
+            await _monitor_window(
+                cluster,
+                excluded,
+                duration=PFN_DOWN_DURATION,
+                label=f"phase1b-down-{victim_id}",
+            )
+            during_stop_snap = tx_sender.snapshot()
+            window_log.append(
+                (f"Phase 1b {victim_id} DOWN ({PFN_DOWN_DURATION}s)",
+                 during_stop_snap - pre_stop_snap)
+            )
+
+            LOG.info(f"[phase 1b] RESTART {victim_id}")
+            assert await victim.start(), f"{victim_id} failed to restart"
+            excluded.discard(victim_id)
+
+            # Catchup: wait until victim re-joins steady state.
+            ok = await _wait_steady(
+                cluster, set(), timeout=CATCHUP_TIMEOUT,
+                label=f"phase1b-catchup-{victim_id}",
+            )
+            assert ok, (
+                f"{victim_id} did not re-converge within {CATCHUP_TIMEOUT}s — "
+                f"refusing to proceed to next stop"
+            )
+            after_catchup_snap = tx_sender.snapshot()
+            window_log.append(
+                (f"Phase 1b {victim_id} catchup",
+                 after_catchup_snap - during_stop_snap)
+            )
+
+            # After pfn1 returns, pfn3 may still be mid re-dial (≤60s backoff).
+            # Do not stop pfn2 until wall time since pfn1 stop covers that cliff;
+            # otherwise pfn3 can have zero live PreferredUpstream (topology stall).
+            if victim_id == "pfn1":
+                elapsed = time.monotonic() - stop_mono
+                remaining = UPSTREAM_REDIAL_SETTLE_SECS - elapsed
+                if remaining > 0:
+                    LOG.info(
+                        f"[phase 1b] dual-upstream re-dial settle: sleep {remaining:.1f}s "
+                        f"(elapsed_since_pfn1_stop={elapsed:.1f}s, "
+                        f"target={UPSTREAM_REDIAL_SETTLE_SECS}s)"
+                    )
+                    settle_snap = tx_sender.snapshot()
+                    await asyncio.sleep(remaining)
+                    window_log.append(
+                        (
+                            f"Phase 1b pfn1 re-dial settle ({remaining:.0f}s)",
+                            tx_sender.snapshot() - settle_snap,
+                        )
+                    )
+                else:
+                    LOG.info(
+                        f"[phase 1b] dual-upstream re-dial settle: skip "
+                        f"(elapsed_since_pfn1_stop={elapsed:.1f}s already "
+                        f">= {UPSTREAM_REDIAL_SETTLE_SECS}s)"
+                    )
+
+        # Phase 1c — post-tail steady state to confirm everything still healthy.
+        LOG.info(f"[phase 1c] post-tail monitoring for {POST_TAIL_DURATION}s")
+        post_tail_start_snap = tx_sender.snapshot()
+        await _monitor_window(
+            cluster, set(), duration=POST_TAIL_DURATION, label="phase1c-tail"
+        )
+        post_tail_end_snap = tx_sender.snapshot()
+        window_log.append(
+            ("Phase 1c (post-tail)", post_tail_end_snap - post_tail_start_snap)
+        )
+    finally:
+        await tx_sender.stop()
+        tx_sender.log_stats()
+
+    # Per-window TxSender breakdown — primary signal for §10 mempool theory.
+    LOG.info("=" * 60)
+    LOG.info("PER-WINDOW TX BREAKDOWN")
+    LOG.info("=" * 60)
+    for label, delta in window_log:
+        LOG.info(f"  {label}: {delta}")
+    LOG.info("=" * 60)
+
+    # Dump every sent hash + status to a file for post-mortem grep against
+    # node-side mempool-trace logs. Shows which peers received which txns.
+    import json as _json
+    artifacts_dir = pathlib.Path(__file__).parent / "artifacts"
+    artifacts_dir.mkdir(exist_ok=True)
+    dump_path = artifacts_dir / "tx_trace.json"
+    dump_path.write_text(_json.dumps({
+        "sent": tx_sender.sent_hashes,
+        "confirmed": sorted(tx_sender.confirmed_hashes),
+        "timeout": tx_sender.timeout_hashes,
+    }, indent=2))
+    LOG.info(f"[trace] wrote tx hash dump to {dump_path}")
+
+    # Phase 1 hard assertions.
+    final_heights = await _get_live_heights(cluster, set())
+    for nid in NODE_IDS:
+        assert nid in final_heights, f"{nid} unreachable at Phase 1 end"
+        assert final_heights[nid] > initial[nid], (
+            f"{nid} did not advance: initial={initial[nid]} "
+            f"final={final_heights[nid]}"
+        )
+
+    # End-to-end health on Phase 1.
+    #
+    # Ideal: every tx pfn3 accepted via RPC produces a receipt (broadcast
+    # through PFN failover → validator block → synced back). In practice
+    # liquent's mempool is single-cast (per `_local/drafts/pfn/mempool-
+    # broadcast-design.md` §2): each tx ships to exactly one upstream peer,
+    # so killing that peer in its sync_states-detection window loses the
+    # in-flight batch. Until the multi-cast fix lands (design doc §3, plan
+    # C), this test allows a small timeout fraction. Hard zero on send
+    # failures stays — those are wire-level wrong, not a failover-window
+    # quirk.
+    PHASE1_TIMEOUT_TOLERANCE = 0.10
+    assert tx_sender.total_sent > 0, "TxSender produced no txns at all"
+    assert tx_sender.total_failed == 0, (
+        f"TxSender saw {tx_sender.total_failed} send failures during Phase 1"
+    )
+    timeout_ratio = tx_sender.total_timeout / tx_sender.total_sent
+    assert timeout_ratio <= PHASE1_TIMEOUT_TOLERANCE, (
+        f"TxSender timeout ratio {timeout_ratio:.2%} exceeds "
+        f"{PHASE1_TIMEOUT_TOLERANCE:.0%} tolerance "
+        f"(sent={tx_sender.total_sent} confirmed={tx_sender.total_confirmed} "
+        f"timeout={tx_sender.total_timeout}). Either the failover window grew "
+        f"beyond what single-cast can survive, or broadcast/sync is broken "
+        f"outside the stop windows. See per-window breakdown above."
+    )
+
+    # Phase 2 — pfn3 self-restart with both upstreams healthy.
+    LOG.info("[phase 2] stopping pfn3 to verify leaf-node recovery via redundant upstreams")
+    pfn3 = cluster.get_node("pfn3")
+    assert await pfn3.stop(), "pfn3 failed to stop"
+    await asyncio.sleep(30)
+    LOG.info("[phase 2] restarting pfn3")
+    assert await pfn3.start(), "pfn3 failed to restart"
+
+    ok = await _wait_steady(
+        cluster, set(), timeout=CATCHUP_TIMEOUT, label="phase2-pfn3-catchup"
+    )
+    assert ok, f"pfn3 failed to catch up via pfn1/pfn2 within {CATCHUP_TIMEOUT}s"
+
+    # Final RPC probe: prove pfn3 RPC forwarding works after its restart.
+    LOG.info("[phase 2] post-restart pfn3 RPC -> validator probe")
+    await _send_tx_via_pfn_and_assert_inclusion(cluster, sender_node_id="pfn3")
+
+    # Log regression guard: pfn3's consensus log must not show
+    # "No Vfn peers available" (commit 16ebf363's smoke alarm).
+    pfn3_text = _node_log_text(cluster.get_node("pfn3"))
+    assert "No Vfn peers available" not in pfn3_text, (
+        "pfn3 emitted 'No Vfn peers available' — sync-path still routing on "
+        "Vfn instead of Public. Regression of commit 16ebf363."
+    )
+
+    # Phase 3 — silent black-hole commit-latency safety net (poll-timeline v1).
+    #
+    # When a PFN is alive (RPC + consensus healthy, still in sync_states) but
+    # its mempool broadcaster is silenced, pfn3 RPC tx must still commit via
+    # the Failover-assigned path. Failover Fresh uses
+    # before=now-shared_mempool_failover_delay_ms (default 500ms); there is
+    # no Arch-A cache TTL rebroadcast cycle.
+    #
+    # Two halves blackhole pfn1 then pfn2; per-half SLA is on **commit**
+    # p50/p99 (client submit→confirm), not isolated first-alt path latency.
+    # Instant `before` semantics: unit tests `t5_*` in mempool.rs.
+    await _phase3_silent_blackhole(cluster)
+
+    LOG.info("PFN fan-out test PASSED")
+
+
+async def _run_blackhole_half(
+    cluster: Cluster,
+    target_pfn_name: str,
+    bench_accounts: list,
+    duration_secs: int,
+    label: str,
+) -> dict:
+    """
+    One half of Phase 3: blackhole `target_pfn_name`, drive multi-account
+    load via pfn3 for `duration_secs`, then restore the target and wait for
+    steady state before returning. Returns a stats dict.
+    """
+    target = cluster.get_node(target_pfn_name)
+
+    LOG.info(
+        f"[phase 3{label}] {target_pfn_name} → LIQUENT_BLACKHOLE_BROADCAST=1"
+    )
+    assert await target.stop(), f"{target_pfn_name} failed to stop"
+    target.extra_env["LIQUENT_BLACKHOLE_BROADCAST"] = "1"
+    assert await target.start(), (
+        f"{target_pfn_name} failed to restart in blackhole mode"
+    )
+    assert target.w3.eth.block_number > 0, (
+        f"{target_pfn_name} RPC dead after blackhole restart"
+    )
+    # priority.rs ~2× update window so sync_states + top_peer lists settle.
+    await asyncio.sleep(2.0)
+
+    sender = MultiAccountTxSender(
+        cluster, accounts=bench_accounts, target_node_id="pfn3",
+        tx_interval=0.1,  # ~10 tx/s aggregate
+    )
+    sender.start()
+    LOG.info(
+        f"[phase 3{label}] driving {duration_secs}s load via pfn3 "
+        f"({target_pfn_name} blackholed)"
+    )
+    await asyncio.sleep(duration_secs)
+    await sender.stop()
+
+    LOG.info(f"[phase 3{label}] restoring {target_pfn_name}")
+    assert await target.stop(), f"{target_pfn_name} failed to stop for restore"
+    target.extra_env.pop("LIQUENT_BLACKHOLE_BROADCAST", None)
+    assert await target.start(), (
+        f"{target_pfn_name} failed to restart in normal mode"
+    )
+    ok = await _wait_steady(
+        cluster, set(), timeout=CATCHUP_TIMEOUT,
+        label=f"phase3{label}-restore",
+    )
+    assert ok, (
+        f"{target_pfn_name} did not re-converge within {CATCHUP_TIMEOUT}s "
+        f"after restore"
+    )
+
+    stats = {
+        "target": target_pfn_name,
+        "label": label,
+        "sent": sender.total_sent,
+        "confirmed": sender.total_confirmed,
+        "timeout": sender.total_timeout,
+        "failed": sender.total_failed,
+        "p50": sender.latency_pct(50),
+        "p95": sender.latency_pct(95),
+        "p99": sender.latency_pct(99),
+    }
+    LOG.info(
+        f"[phase 3{label}] {target_pfn_name} blackhole stats: "
+        f"sent={stats['sent']} confirmed={stats['confirmed']} "
+        f"timeout={stats['timeout']} failed={stats['failed']} | "
+        f"p50={stats['p50']:.2f}s p95={stats['p95']:.2f}s p99={stats['p99']:.2f}s"
+    )
+    return stats
+
+
+async def _phase3_silent_blackhole(cluster: Cluster):
+    """
+    Phase 3: two-half silent-blackhole **commit-latency** safety net.
+
+    Half A blackholes pfn1, Half B blackholes pfn2. Per half we assert that
+    client submit→confirm latencies stay well below multi-second Arch-A TTL
+    ceilings, regardless of which peer priority.rs marked Primary.
+
+    Metrics are end-to-end commit p50/p99 (not isolated first-alt path
+    latency). Failover `before` Instant semantics are covered by unit
+    `t5_*` in aptos-core/mempool/src/core_mempool/mempool.rs.
+    """
+    LOG.info("=" * 70)
+    LOG.info("[phase 3] silent black-hole (two-half SLA verification)")
+    LOG.info("=" * 70)
+
+    pre = await _get_live_heights(cluster, set())
+    assert len(pre) == 5, f"expected 5 live nodes before Phase 3, got {pre}"
+    LOG.info(f"[phase 3] pre-blackhole heights: {pre}")
+
+    # Multi-account pool spreads senders across all 4 sender_buckets; even
+    # at ~10 tps where num_top_peers=1 collapses Primary to a single peer,
+    # using many sender addresses keeps the bucket distribution uniform.
+    PHASE3_ACCOUNT_POOL = 32
+    PHASE3_LOAD_SECS = 30
+    bench_accounts = cluster.get_bench_accounts(limit=PHASE3_ACCOUNT_POOL)
+    assert len(bench_accounts) >= 8, (
+        f"Phase 3 needs ≥8 funded accounts, got {len(bench_accounts)} — "
+        f"check accounts.csv / faucet_init"
+    )
+    LOG.info(f"[phase 3] loaded {len(bench_accounts)} pre-funded accounts")
+
+    half_a = await _run_blackhole_half(
+        cluster, "pfn1", bench_accounts, PHASE3_LOAD_SECS, label="a",
+    )
+    half_b = await _run_blackhole_half(
+        cluster, "pfn2", bench_accounts, PHASE3_LOAD_SECS, label="b",
+    )
+
+    # Per-half SLA (commit latency under silent Primary black-hole).
+    #
+    # Historical Arch-A: cache TTL 5s → worst-case slot-flip ceiling
+    #   3 × 5s + 3s slack = 18s
+    #
+    # poll-timeline v1: no TTL rebroadcast; Failover Fresh gated by
+    # shared_mempool_failover_delay_ms (default 500ms) via read_timeline
+    # `before`. Local e2e black-hole commit p99 was ~1.7–2.2s.
+    #
+    # Tightened safety net (still commit proxy, NOT first-alt 500ms proof):
+    #   p50 ≤ 4s   — must not look like ~5s Arch-A TTL-world median
+    #   p99 ≤ 10s  — ≪ historical Arch-A 18s; absorbs loopback load variance
+    #                (observed black-hole commit p99 ≈ 1.7–2.2s on a quiet run,
+    #                 ≈ 7.1–7.6s under noisier host load — keep margin)
+    EXPECTED_MIN_SENT = PHASE3_LOAD_SECS * 5
+    P50_CEILING = 4.0    # seconds; anti-regression vs Arch-A TTL median
+    P99_CEILING = 10.0   # seconds; black-hole commit safety net (not first-alt)
+    for half in (half_a, half_b):
+        tag = f"phase 3{half['label']}/{half['target']}"
+        assert half["sent"] >= EXPECTED_MIN_SENT, (
+            f"[{tag}] expected ≥{EXPECTED_MIN_SENT} tx, got {half['sent']} — "
+            f"MultiAccountTxSender stalled?"
+        )
+        assert half["timeout"] == 0, (
+            f"[{tag}] {half['timeout']} timeouts — failover path is NOT "
+            f"catching in-flight txs within the safety ceiling"
+        )
+        assert half["failed"] == 0, f"[{tag}] send failures: {half['failed']}"
+        assert half["p50"] <= P50_CEILING, (
+            f"[{tag}] p50={half['p50']:.2f}s exceeds ceiling {P50_CEILING:.1f}s "
+            f"(commit proxy; ≥4s suggests Arch-A TTL-scale failover lag)"
+        )
+        assert half["p99"] <= P99_CEILING, (
+            f"[{tag}] p99={half['p99']:.2f}s exceeds safety ceiling "
+            f"{P99_CEILING:.1f}s (commit latency under black-hole; not "
+            f"isolated first-alt / failover_delay 500ms SLA)"
+        )
+
+    LOG.info(
+        f"[phase 3] SLA PASSED: halves: pfn1-blackhole "
+        f"p50={half_a['p50']:.2f}s p95={half_a['p95']:.2f}s p99={half_a['p99']:.2f}s, "
+        f"pfn2-blackhole "
+        f"p50={half_b['p50']:.2f}s p95={half_b['p95']:.2f}s p99={half_b['p99']:.2f}s "
+        f"(ceilings p50≤{P50_CEILING:.1f}s p99≤{P99_CEILING:.1f}s; commit proxy)"
+    )
+
+    # Final probe: cluster fully healthy again after both halves restored.
+    _, _ = await _send_tx_via_pfn_and_assert_inclusion(cluster, "pfn3")
+    LOG.info("[phase 3] PASSED")

@@ -1,0 +1,562 @@
+use crate::ConsensusArgs;
+use alloy_consensus::transaction::SignerRecoverable;
+use alloy_eips::{eip4895::Withdrawals, Decodable2718};
+use alloy_primitives::{Address, B256, U256};
+use block_buffer_manager::get_block_buffer_manager;
+use core::panic;
+use dashmap::DashMap;
+use laptos::api_types::{
+    account::ExternalAccountAddress,
+    compute_res::TxnStatus,
+    config_storage::{BlockNumber, ConfigStorage, OnChainConfig, OnChainConfigResType},
+    u256_define::BlockId as ExternalBlockId,
+    ExternalBlock, GLOBAL_CRYPTO_TXN_HASHER,
+};
+use lreth::reth_transaction_pool::{EthPooledTransaction, ValidPoolTransaction};
+use proposer_reth_map::get_reth_address_by_index;
+
+use alloy_rpc_types_eth::TransactionRequest;
+use laptos::aptos_metrics_core::{register_int_counter_vec, IntCounterVec};
+use lreth::{
+    liquent_storage::block_view_storage::BlockViewStorage,
+    reth::rpc::builder::auth::AuthServerHandle,
+    reth_db::DatabaseEnv,
+    reth_node_api::NodeTypesWithDBAdapter,
+    reth_node_ethereum::EthereumNode,
+    reth_pipe_exec_layer_ext_v2::{ExecutionResult, OrderedBlock, PipeExecLayerApi},
+    reth_primitives::TransactionSigned,
+    reth_provider::{providers::BlockchainProvider, BlockNumReader, ChainSpecProvider},
+    reth_rpc_api::eth::{helpers::EthCall, RpcTypes},
+};
+use once_cell::sync::Lazy;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
+
+use tokio::sync::broadcast;
+use tracing::*;
+
+const FILTER_REASON_DECODE_FAILED: &str = "decode_failed";
+const FILTER_REASON_RECOVER_SIGNER_FAILED: &str = "recover_signer_failed";
+const FILTER_REASON_MISSING_SENDER_OR_BODY: &str = "missing_sender_or_body";
+const COINBASE_FALLBACK_NO_PROPOSER_INDEX: &str = "no_proposer_index";
+const COINBASE_FALLBACK_PROPOSER_NOT_IN_MAP: &str = "proposer_not_in_map";
+const COINBASE_FALLBACK_INVALID_ADDRESS_LENGTH: &str = "invalid_address_length";
+
+static GCEI_FILTERED_TX_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "gcei_filtered_tx_total",
+        "Number of transactions filtered while converting consensus blocks into GCEI ordered blocks",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+static GCEI_COINBASE_FALLBACK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "gcei_coinbase_fallback_total",
+        "Number of times GCEI block coinbase fell back to the zero address",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+pub(crate) type RethBlockChainProvider =
+    BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
+
+pub(crate) type RethTransactionPool = lreth::reth_transaction_pool::EthTransactionPool<
+    RethBlockChainProvider,
+    lreth::reth_transaction_pool::blobstore::DiskFileBlobStore,
+    lreth::reth_node_ethereum::EthEvmConfig,
+>;
+
+pub(crate) trait RethEthCall:
+    EthCall<NetworkTypes: RpcTypes<TransactionRequest = TransactionRequest>>
+{
+}
+
+impl<T> RethEthCall for T where
+    T: EthCall<NetworkTypes: RpcTypes<TransactionRequest = TransactionRequest>>
+{
+}
+
+pub(crate) type RethPipeExecLayerApi<EthApi> =
+    PipeExecLayerApi<BlockViewStorage<RethBlockChainProvider>, EthApi>;
+
+/// txn_cache entry value: `(inserted_at, transaction)`.
+/// Recording the insertion time lets the background sweeper evict entries that stay
+/// uncommitted past the TTL, preventing unbounded growth (see TXN_CACHE_ENTRY_TTL in
+/// mempool.rs).
+pub(crate) type TxnCacheEntry = (Instant, Arc<ValidPoolTransaction<EthPooledTransaction>>);
+pub(crate) type TxnCache = Arc<DashMap<[u8; 32], TxnCacheEntry>>;
+
+pub struct RethCli<EthApi: RethEthCall> {
+    _auth: AuthServerHandle,
+    pipe_api: RethPipeExecLayerApi<EthApi>,
+    chain_id: u64,
+    provider: RethBlockChainProvider,
+    _pool: RethTransactionPool,
+    txn_cache: TxnCache,
+    _txn_batch_size: usize,
+    current_epoch: AtomicU64,
+    shutdown: broadcast::Receiver<()>,
+}
+
+pub fn convert_account(acc: Address) -> ExternalAccountAddress {
+    let mut bytes = [0u8; 32];
+    bytes[12..].copy_from_slice(acc.as_slice());
+    ExternalAccountAddress::new(bytes)
+}
+
+#[allow(clippy::ptr_arg)]
+fn calculate_txn_hash(bytes: &Vec<u8>) -> [u8; 32] {
+    alloy_primitives::utils::keccak256(bytes).as_slice().try_into().unwrap()
+}
+
+impl<EthApi: RethEthCall> RethCli<EthApi> {
+    pub async fn new(
+        args: ConsensusArgs<EthApi>,
+        txn_cache: TxnCache,
+        shutdown: broadcast::Receiver<()>,
+    ) -> Self {
+        let chian_info = args.provider.chain_spec().chain;
+        let chain_id = match chian_info.into_kind() {
+            lreth::reth_chainspec::ChainKind::Named(n) => n as u64,
+            lreth::reth_chainspec::ChainKind::Id(id) => id,
+        };
+        GLOBAL_CRYPTO_TXN_HASHER.get_or_init(|| Box::new(calculate_txn_hash));
+        RethCli {
+            _auth: args.engine_api,
+            pipe_api: args.pipeline_api,
+            chain_id,
+            provider: args.provider,
+            _pool: args.pool,
+            txn_cache,
+            _txn_batch_size: 2000,
+            current_epoch: AtomicU64::new(0),
+            shutdown,
+        }
+    }
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    fn txn_to_signed(
+        bytes: &[u8],
+        _chain_id: u64,
+    ) -> Result<(Address, TransactionSigned), (&'static str, String)> {
+        let mut slice = bytes;
+        let txn = TransactionSigned::decode_2718(&mut slice).map_err(|e| {
+            (FILTER_REASON_DECODE_FAILED, format!("Failed to decode transaction: {e}"))
+        })?;
+        let signer = txn.recover_signer().map_err(|e| {
+            (
+                FILTER_REASON_RECOVER_SIGNER_FAILED,
+                format!("Failed to recover signer from transaction: {e}"),
+            )
+        })?;
+        Ok((signer, txn))
+    }
+
+    /// Get reth coinbase address from proposer's validator index
+    /// Returns the reth account address of the proposer if found, otherwise returns Address::ZERO
+    fn get_coinbase_from_proposer_index(proposer_index: Option<u64>) -> Address {
+        let index = match proposer_index {
+            Some(idx) => idx,
+            None => {
+                GCEI_COINBASE_FALLBACK_TOTAL
+                    .with_label_values(&[COINBASE_FALLBACK_NO_PROPOSER_INDEX])
+                    .inc();
+                // Log when proposer_index is absent — this means the block
+                // metadata from consensus did not include a proposer.
+                warn!(
+                    "Block has no proposer_index in metadata, using Address::ZERO as coinbase. \
+                     This may indicate a consensus-layer issue. \
+                     Metric: coinbase_zero_address_fallback{{reason=no_proposer_index}}"
+                );
+                return Address::ZERO;
+            }
+        };
+
+        // Get reth address from global map (built in epoch_manager when epoch starts)
+        match get_reth_address_by_index(index) {
+            Some(reth_addr_bytes) => {
+                if reth_addr_bytes.len() == 20 {
+                    Address::from_slice(&reth_addr_bytes)
+                } else {
+                    GCEI_COINBASE_FALLBACK_TOTAL
+                        .with_label_values(&[COINBASE_FALLBACK_INVALID_ADDRESS_LENGTH])
+                        .inc();
+                    warn!(
+                        "Reth address length {} is not 20 bytes for proposer index {}, using ZERO. \
+                         Metric: coinbase_zero_address_fallback{{reason=invalid_address_length}}",
+                        reth_addr_bytes.len(),
+                        index
+                    );
+                    Address::ZERO
+                }
+            }
+            None => {
+                GCEI_COINBASE_FALLBACK_TOTAL
+                    .with_label_values(&[COINBASE_FALLBACK_PROPOSER_NOT_IN_MAP])
+                    .inc();
+                warn!(
+                    "Failed to get reth coinbase for proposer index {}, using ZERO. \
+                     Metric: coinbase_zero_address_fallback{{reason=proposer_not_in_map}}",
+                    index
+                );
+                Address::ZERO
+            }
+        }
+    }
+
+    pub async fn push_ordered_block(
+        &self,
+        mut block: ExternalBlock,
+        parent_id: B256,
+    ) -> Result<(), String> {
+        trace!("push ordered block {:?} with parent id {}", block, parent_id);
+        let system_time = Instant::now();
+        let pipe_api = &self.pipe_api;
+
+        let mut senders = vec![None; block.txns.len()];
+        let mut transactions = vec![None; block.txns.len()];
+        let mut filtered_reasons = vec![None; block.txns.len()];
+
+        {
+            for (idx, txn) in block.txns.iter().enumerate() {
+                let key = txn.committed_hash();
+                // Commit hit: remove from cache (drop insertion time, keep the tx).
+                if let Some((_, (_, cached_txn))) = self.txn_cache.remove(&key) {
+                    senders[idx] = Some(cached_txn.sender());
+                    transactions[idx] = Some(cached_txn.transaction.transaction().inner().clone());
+                }
+            }
+        }
+
+        block
+            .txns
+            .par_iter_mut()
+            .enumerate()
+            .filter(|(idx, _)| senders[*idx].is_none())
+            .map(|(idx, txn)| (idx, Self::txn_to_signed(txn.bytes().as_slice(), self.chain_id)))
+            .collect::<Vec<(usize, Result<(Address, TransactionSigned), (&'static str, String)>)>>()
+            .into_iter()
+            .for_each(|(idx, result)| match result {
+                Ok((sender, transaction)) => {
+                    senders[idx] = Some(sender);
+                    transactions[idx] = Some(transaction);
+                }
+                Err((reason, e)) => {
+                    warn!("Skipping malformed transaction at index {}: {}", idx, e);
+                    filtered_reasons[idx] = Some(reason);
+                }
+            });
+
+        // Filter out transactions that failed decoding/signer recovery
+        let mut valid_senders = Vec::with_capacity(senders.len());
+        let mut valid_transactions = Vec::with_capacity(transactions.len());
+        for (idx, (sender, transaction)) in
+            senders.into_iter().zip(transactions.into_iter()).enumerate()
+        {
+            match (sender, transaction) {
+                (Some(s), Some(t)) => {
+                    valid_senders.push(s);
+                    valid_transactions.push(t);
+                }
+                _ => {
+                    let reason =
+                        filtered_reasons[idx].unwrap_or(FILTER_REASON_MISSING_SENDER_OR_BODY);
+                    GCEI_FILTERED_TX_TOTAL.with_label_values(&[reason]).inc();
+                    warn!("Filtering out transaction at index {} with missing sender or body", idx);
+                }
+            }
+        }
+        let senders = valid_senders;
+        let transactions = valid_transactions;
+
+        let (randao, randomness) = match block.block_meta.randomness {
+            Some(randao) => {
+                (B256::from_slice(randao.0.as_ref()), U256::from_be_slice(randao.0.as_ref()))
+            }
+            None => (B256::ZERO, U256::from(0)),
+        };
+
+        info!("push ordered block time deserialize {:?}ms", system_time.elapsed().as_millis());
+
+        // Get reth coinbase from proposer's validator index
+        let coinbase = Self::get_coinbase_from_proposer_index(block.block_meta.proposer_index);
+        info!(
+            "block_number: {:?} proposer_index: {:?} coinbase: {:?}",
+            block.block_meta.block_number, block.block_meta.proposer_index, coinbase
+        );
+
+        pipe_api.push_ordered_block(OrderedBlock {
+            parent_id,
+            id: B256::from_slice(block.block_meta.block_id.as_bytes()),
+            number: block.block_meta.block_number,
+            timestamp_us: block.block_meta.usecs,
+            coinbase,
+            prev_randao: randao,
+            withdrawals: Withdrawals::new(Vec::new()),
+            transactions,
+            senders,
+            epoch: block.block_meta.epoch,
+            proposer_index: block.block_meta.proposer_index,
+            failed_proposer_indices: block.block_meta.failed_proposer_indices,
+            extra_data: block.extra_data,
+            randomness,
+        });
+        Ok(())
+    }
+
+    pub async fn recv_compute_res(&self) -> Result<ExecutionResult, String> {
+        let pipe_api = &self.pipe_api;
+        let result = pipe_api
+            .pull_executed_block_hash()
+            .await
+            .ok_or_else(|| "failed to recv compute res: channel closed".to_string())?;
+        debug!("recv compute res done");
+        Ok(result)
+    }
+
+    pub async fn send_committed_block_info(
+        &self,
+        block_id: laptos::api_types::u256_define::BlockId,
+        block_hash: Option<B256>,
+    ) -> Result<(), String> {
+        debug!("commit block {:?} with hash {:?}", block_id, block_hash);
+        let block_id = B256::from_slice(block_id.0.as_ref());
+        let pipe_api = &self.pipe_api;
+        pipe_api.commit_executed_block_hash(block_id, block_hash);
+        debug!("commit block done");
+        Ok(())
+    }
+
+    pub async fn wait_for_block_persistence(&self, block_number: u64) -> Result<(), String> {
+        debug!("wait for block persistence {:?}", block_number);
+        let pipe_api = &self.pipe_api;
+        pipe_api.wait_for_block_persistence(block_number).await;
+        debug!("wait for block persistence done");
+        Ok(())
+    }
+
+    pub async fn start_execution(&self) -> Result<(), String> {
+        let mut start_ordered_block = self
+            .provider
+            .recover_block_number()
+            .map_err(|e| format!("Failed to recover block number: {e}"))? +
+            1;
+        // Initialize current_epoch from block buffer manager
+        let buffer_epoch = get_block_buffer_manager().get_current_epoch().await;
+        self.current_epoch.store(buffer_epoch, Ordering::SeqCst);
+        info!("start_execution initialized with epoch {}", buffer_epoch);
+
+        // missing signals between iterations
+        let mut shutdown = self.shutdown.resubscribe();
+        loop {
+            let current_epoch = self.current_epoch.load(Ordering::SeqCst);
+            // max executing block number
+            let exec_blocks = tokio::select! {
+                res = get_block_buffer_manager().get_ordered_blocks(start_ordered_block, None, current_epoch) => res,
+                _ = shutdown.recv() => {
+                    info!("Shutdown signal received, stopping execution loop");
+                    break;
+                }
+            };
+            if let Err(e) = exec_blocks {
+                let from = start_ordered_block;
+                if e.to_string().contains("Buffer is in epoch change") ||
+                    current_epoch != get_block_buffer_manager().get_current_epoch().await
+                {
+                    // consume_epoch_change returns (new_epoch, epoch_change_block_number)
+                    // and resets latest_epoch_change_block_number to 0 atomically.
+                    let (new_epoch, epoch_change_block_number) =
+                        get_block_buffer_manager().consume_epoch_change().await;
+                    start_ordered_block = epoch_change_block_number + 1;
+                    let old_epoch = self.current_epoch.swap(new_epoch, Ordering::SeqCst);
+                    info!("Buffer is in epoch change, reset start_ordered_block from {} to {}, epoch from {} to {}", 
+                        from, start_ordered_block, old_epoch, new_epoch);
+                } else {
+                    warn!("failed to get ordered blocks: {}", e);
+                }
+                continue;
+            }
+            let exec_blocks = exec_blocks.unwrap();
+            if exec_blocks.is_empty() {
+                info!("no ordered blocks");
+                continue;
+            }
+
+            start_ordered_block =
+                exec_blocks.last().expect("checked non-empty above").0.block_meta.block_number + 1;
+            for (block, parent_id) in exec_blocks {
+                info!(
+                    "send reth ordered block num {:?} id {:?} epoch {:?} with parent id {}",
+                    block.block_meta.block_number,
+                    block.block_meta.block_id,
+                    block.block_meta.epoch,
+                    parent_id
+                );
+                let parent_id = B256::from_slice(parent_id.as_bytes());
+                self.push_ordered_block(block, parent_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn start_commit_vote(&self) -> Result<(), String> {
+        // GSDK-022: Track consecutive errors to distinguish transient from fatal failures
+        let mut consecutive_errors = 0u32;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+
+        let mut shutdown = self.shutdown.resubscribe();
+        loop {
+            let execution_result = tokio::select! {
+                res = self.recv_compute_res() => res,
+                _ = shutdown.recv() => {
+                    info!("Shutdown signal received, stopping commit vote loop");
+                    break;
+                }
+            };
+
+            let execution_result = match execution_result {
+                Ok(res) => {
+                    consecutive_errors = 0; // Reset on success
+                    res
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        // GSDK-022: Too many consecutive failures — channel is likely
+                        // permanently broken. Trigger shutdown rather than silent stall.
+                        error!(
+                            "recv_compute_res failed {} consecutive times (last: {}). \
+                             Triggering graceful shutdown.",
+                            consecutive_errors, e
+                        );
+                        return Err(format!(
+                            "Commit vote loop terminated after {consecutive_errors} consecutive errors: {e}",
+                        ));
+                    }
+                    warn!(
+                        "recv_compute_res failed (attempt {}/{}): {}. Retrying...",
+                        consecutive_errors, MAX_CONSECUTIVE_ERRORS, e
+                    );
+                    // Brief delay before retry to avoid tight error loop
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let mut block_hash_data = [0u8; 32];
+            block_hash_data.copy_from_slice(execution_result.block_hash.as_slice());
+            let block_id = ExternalBlockId::from_bytes(execution_result.block_id.as_slice());
+            let block_number = execution_result.block_number;
+            let tx_infos = execution_result.txs_info;
+            let epoch = self.current_epoch.load(Ordering::SeqCst);
+            let txn_status = Arc::new(Some(
+                tx_infos
+                    .iter()
+                    .map(|tx_info| TxnStatus {
+                        txn_hash: *tx_info.tx_hash,
+                        sender: convert_account(tx_info.sender).bytes(),
+                        nonce: tx_info.nonce,
+                        is_discarded: tx_info.is_discarded,
+                    })
+                    .collect(),
+            ));
+            let events = execution_result.liquent_events;
+            get_block_buffer_manager()
+                .set_compute_res(block_id, block_hash_data, block_number, epoch, txn_status, events)
+                .await
+                .map_err(|e| format!("failed to set compute res: {e}"))?;
+        }
+        Ok(())
+    }
+
+    pub async fn start_commit(&self) -> Result<(), String> {
+        let mut start_commit_num = self
+            .provider
+            .recover_block_number()
+            .map_err(|e| format!("Failed to recover block number: {e}"))? +
+            1;
+        let mut shutdown = self.shutdown.resubscribe();
+        loop {
+            let epoch = self.current_epoch.load(Ordering::SeqCst);
+            let block_ids = tokio::select! {
+                res = get_block_buffer_manager().get_committed_blocks(start_commit_num, None, epoch) => res,
+                _ = shutdown.recv() => {
+                    info!("Shutdown signal received, stopping commit loop");
+                    break;
+                }
+            };
+            if let Err(e) = block_ids {
+                warn!("failed to get committed blocks: {}", e);
+                continue;
+            }
+            let block_ids = block_ids.unwrap();
+            if block_ids.is_empty() {
+                continue;
+            }
+            let last_block = block_ids.last().expect("checked non-empty above");
+            let block_id = self.pipe_api.get_block_id(last_block.num).ok_or_else(|| {
+                error!("commit num {} not found block id", start_commit_num);
+                format!("commit num {start_commit_num} not found block id")
+            })?;
+            assert_eq!(ExternalBlockId::from_bytes(block_id.as_slice()), last_block.block_id);
+            start_commit_num = last_block.num + 1;
+            let mut persist_notifiers = Vec::new();
+            for block_id_num_hash in block_ids {
+                self.send_committed_block_info(
+                    block_id_num_hash.block_id,
+                    block_id_num_hash.hash.map(|x| B256::from_slice(x.as_slice())),
+                )
+                .await
+                .map_err(|e| format!("failed to send committed block info: {e}"))?;
+                if let Some(persist_notifier) = block_id_num_hash.persist_notifier {
+                    persist_notifiers.push((block_id_num_hash.num, persist_notifier));
+                }
+            }
+
+            let last_block_number = self
+                .provider
+                .recover_block_number()
+                .map_err(|e| format!("Failed to recover block number: {e}"))?;
+            get_block_buffer_manager()
+                .set_state(start_commit_num - 1, last_block_number)
+                .await
+                .map_err(|e| format!("failed to set state: {e}"))?;
+            for (block_number, persist_notifier) in persist_notifiers {
+                info!("wait_for_block_persistence num {:?} send persist_notifier", block_number);
+                self.wait_for_block_persistence(block_number).await?;
+                let _ = persist_notifier.send(()).await;
+            }
+        }
+        Ok(())
+    }
+}
+pub struct RethCliConfigStorage<EthApi: RethEthCall> {
+    reth_cli: Arc<RethCli<EthApi>>,
+}
+
+impl<EthApi: RethEthCall> RethCliConfigStorage<EthApi> {
+    pub fn new(reth_cli: Arc<RethCli<EthApi>>) -> Self {
+        Self { reth_cli }
+    }
+}
+
+impl<EthApi: RethEthCall> ConfigStorage for RethCliConfigStorage<EthApi> {
+    fn fetch_config_bytes(
+        &self,
+        config_name: OnChainConfig,
+        block_number: BlockNumber,
+    ) -> Option<OnChainConfigResType> {
+        self.reth_cli.pipe_api.fetch_config_bytes(config_name, block_number)
+    }
+}

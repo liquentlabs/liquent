@@ -1,0 +1,236 @@
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GENESIS_CONFIG_FILE="${1:-$SCRIPT_DIR/genesis.toml}"
+OUTPUT_DIR="${LIQUENT_ARTIFACTS_DIR:-$SCRIPT_DIR/output}"
+
+source "$SCRIPT_DIR/utils/common.sh"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXTERNAL_DIR="$PROJECT_ROOT/external"
+
+main() {
+    log_info "Generating genesis artifacts..."
+    
+    if [ ! -f "$GENESIS_CONFIG_FILE" ]; then
+        log_error "Genesis config not found: $GENESIS_CONFIG_FILE"
+        log_info "Copy genesis.toml.example to genesis.toml and configure it."
+        exit 1
+    fi
+    export CONFIG_FILE="$GENESIS_CONFIG_FILE"
+    
+    # Create output dir (don't clean - identity keys from init should be preserved)
+    mkdir -p "$OUTPUT_DIR"
+    
+    # Parse genesis.toml
+    config_json=$(parse_toml)
+    
+    # Find liquent_cli
+    LIQUENT_CLI=$(find_binary "liquent_cli" "$PROJECT_ROOT") || true
+    if [ -z "$LIQUENT_CLI" ]; then
+        log_error "liquent_cli not found! Please build it first."
+        exit 1
+    fi
+    log_info "Using liquent_cli: $LIQUENT_CLI"
+    
+    # Step 1: Clone/update external dependencies
+    log_info "Step 1: Checking external dependencies..."
+    
+    GENESIS_REPO=$(echo "$config_json" | jq -r '.dependencies.genesis_contracts.repo // "https://github.com/liquentlabs/liquent_chain_core_contracts.git"')
+    GENESIS_REF=$(echo "$config_json" | jq -r '.dependencies.genesis_contracts.ref // "main"')
+    
+    GENESIS_CONTRACT_DIR="$EXTERNAL_DIR/liquent_chain_core_contracts"
+    
+    if [ ! -d "$GENESIS_CONTRACT_DIR" ]; then
+        log_warn "liquent_chain_core_contracts not found. Cloning from $GENESIS_REPO..."
+        mkdir -p "$EXTERNAL_DIR"
+        git clone "$GENESIS_REPO" "$GENESIS_CONTRACT_DIR"
+    fi
+
+    # Checkout specified ref and pull latest (critical for branches to avoid stale bytecode)
+    log_info "Checking out ref: $GENESIS_REF..."
+    (
+        cd "$GENESIS_CONTRACT_DIR"
+        git fetch origin
+        # Discard local modifications from previous runs (e.g. genesis_template.json)
+        git checkout -- .
+        git checkout "$GENESIS_REF"
+        # Pull latest if on a branch (no-op for detached HEAD / commit hash)
+        if git symbolic-ref -q HEAD &>/dev/null; then
+            log_info "Pulling latest changes for branch $GENESIS_REF..."
+            git pull origin "$GENESIS_REF"
+        fi
+        # Fix Python 3.9 compatibility: `str | None` → `Optional[str]`
+        python3 -c "
+import re, pathlib
+p = pathlib.Path('scripts/helpers/fix_hex_length.py')
+if p.exists():
+    txt = p.read_text()
+    # Step 1: replace type union syntax
+    txt = txt.replace('str | None', 'Optional[str]')
+    # Step 2: ensure Optional is imported
+    if 'Optional' in txt:
+        m = re.search(r'^from typing import (.+)$', txt, re.MULTILINE)
+        if m and 'Optional' not in m.group(1):
+            txt = txt.replace(m.group(0), m.group(0) + ', Optional')
+        elif not m:
+            txt = txt.replace('import argparse', 'import argparse\nfrom typing import Optional', 1)
+    p.write_text(txt)
+"
+        cd -
+    )
+    
+    # Install dependencies if missing
+    if [ ! -d "$GENESIS_CONTRACT_DIR/node_modules" ]; then
+        log_info "Installing dependencies for liquent_chain_core_contracts..."
+        (
+            cd "$GENESIS_CONTRACT_DIR"
+            if command -v yarn &> /dev/null; then
+                yarn install
+            elif command -v npm &> /dev/null; then
+                npm install
+            else
+                log_error "Neither yarn nor npm found. Cannot install dependencies."
+                exit 1
+            fi
+        )
+    fi
+    
+    # Step 2: Generate validator genesis configuration
+    # Reads only the public-key sidecar (identity.public.yaml) so this works
+    # whether private keys live on disk (identity.yaml) or in Secret Manager.
+    log_info "Step 2: Generating validator genesis configuration..."
+    log_info "  (Reading public sidecars from output/ - run 'make init' first)"
+
+    # Check if public sidecars exist
+    genesis_validators=$(echo "$config_json" | jq -c '.genesis_validators // []')
+    validator_count=$(echo "$genesis_validators" | jq 'length')
+
+    for i in $(seq 0 $((validator_count - 1))); do
+        validator=$(echo "$genesis_validators" | jq ".[$i]")
+        node_id=$(echo "$validator" | jq -r '.id')
+        public_file="$OUTPUT_DIR/$node_id/config/identity.public.yaml"
+        identity_file="$OUTPUT_DIR/$node_id/config/identity.yaml"
+
+        if [ ! -f "$public_file" ] && [ ! -f "$identity_file" ]; then
+            log_error "Identity file not found for $node_id (tried identity.public.yaml and identity.yaml)"
+            log_error "Run 'make init' first to generate node keys."
+            exit 1
+        fi
+    done
+    
+    # Call aggregate_genesis.py
+    python3 "$SCRIPT_DIR/utils/aggregate_genesis.py" "$config_json" --genesis-mode
+    
+    # Organize config files
+    GEN_CONFIG_DIR="$OUTPUT_DIR/genesis_config"
+    mkdir -p "$GEN_CONFIG_DIR"
+    
+    val_genesis_path="$GEN_CONFIG_DIR/validator_genesis.json"
+    if [ -f "$OUTPUT_DIR/validator_genesis.json" ]; then
+        mv "$OUTPUT_DIR/validator_genesis.json" "$val_genesis_path"
+    else
+        log_error "Failed to generate validator_genesis.json"
+        exit 1
+    fi
+    
+    if [ -f "$OUTPUT_DIR/faucet_alloc.json" ]; then
+        mv "$OUTPUT_DIR/faucet_alloc.json" "$GEN_CONFIG_DIR/faucet_alloc.json"
+    fi
+    
+    # Step 3: Generate genesis.json using contracts
+    GEN_SCRIPT="$GENESIS_CONTRACT_DIR/scripts/generate_genesis.sh"
+    
+    if [ ! -f "$GEN_SCRIPT" ]; then
+        log_error "Genesis generation script not found: $GEN_SCRIPT"
+        exit 1
+    fi
+    
+    if ! command -v forge &> /dev/null; then
+        log_error "Forge not found! Install Foundry first."
+        exit 1
+    fi
+    
+    log_info "Step 3: Generating genesis from contract..."
+    ABS_VAL_GENESIS_PATH="$(cd "$(dirname "$val_genesis_path")" && pwd)/$(basename "$val_genesis_path")"
+    
+    # Prepare genesis template (inject faucet if present)
+    local genesis_template="$GENESIS_CONTRACT_DIR/genesis-tool/config/genesis_template.json"
+    local faucet_alloc="$GEN_CONFIG_DIR/faucet_alloc.json"
+    local final_template="$GEN_CONFIG_DIR/genesis_template_merged.json"
+    
+    if [ -f "$faucet_alloc" ]; then
+        log_info "Injecting faucet allocation into template..."
+        jq -s '.[0] * {alloc: (.[0].alloc + .[1])}' "$genesis_template" "$faucet_alloc" > "$final_template"
+        # Copy merged template to the expected location
+        cp "$final_template" "$genesis_template"
+    fi
+    
+    # Generate genesis
+    log_info "Generating genesis block..."
+    cd "$GENESIS_CONTRACT_DIR"
+
+    # Ensure genesis-tool is a standalone workspace so cargo doesn't pick up
+    # a parent workspace (e.g. when running inside a git worktree)
+    local genesis_tool_cargo="$GENESIS_CONTRACT_DIR/genesis-tool/Cargo.toml"
+    if ! grep -q '^\[workspace\]' "$genesis_tool_cargo" 2>/dev/null; then
+        log_info "Patching genesis-tool Cargo.toml for standalone build..."
+        echo -e '\n[workspace]' >> "$genesis_tool_cargo"
+    fi
+
+    ./scripts/generate_genesis.sh --config "$ABS_VAL_GENESIS_PATH"
+    
+    # Copy artifacts back
+    if [ -f "$GENESIS_CONTRACT_DIR/genesis.json" ]; then
+        cp "$GENESIS_CONTRACT_DIR/genesis.json" "$OUTPUT_DIR/genesis.json"
+
+        # Inject liquentMinBaseFee into genesis.json .config (Liquent-reth chainspec marker:
+        # presence => Liquent chain with this floor; absence => no floor).
+        # Default 50 Gwei matches liquent-reth main; override via .genesis.liquent_min_base_fee
+        # in genesis.toml. Injected before .genesis.hardforks merge so hardforks can override.
+        local liquent_min_base_fee
+        liquent_min_base_fee=$(echo "$config_json" | jq '.genesis.liquent_min_base_fee // 50000000000')
+        log_info "Setting config.liquentMinBaseFee = $liquent_min_base_fee"
+        local tmp_genesis="$OUTPUT_DIR/genesis.json.tmp"
+        jq --argjson v "$liquent_min_base_fee" '.config.liquentMinBaseFee = $v' "$OUTPUT_DIR/genesis.json" > "$tmp_genesis"
+        mv "$tmp_genesis" "$OUTPUT_DIR/genesis.json"
+
+        # Inject custom hardfork block numbers into genesis.json .config
+        local hardforks
+        hardforks=$(echo "$config_json" | jq -c '.genesis.hardforks // empty')
+        if [ -n "$hardforks" ]; then
+            log_info "Injecting custom hardfork config: $hardforks"
+            jq --argjson hf "$hardforks" '.config += $hf' "$OUTPUT_DIR/genesis.json" > "$tmp_genesis"
+            mv "$tmp_genesis" "$OUTPUT_DIR/genesis.json"
+        fi
+        
+        # Copy debug files
+        if [ -f "$GENESIS_CONTRACT_DIR/output/genesis_config_modified.json" ]; then
+            cp "$GENESIS_CONTRACT_DIR/output/genesis_config_modified.json" "$GEN_CONFIG_DIR/debug_genesis_config.json"
+        fi
+        if [ -f "$GENESIS_CONTRACT_DIR/account_alloc.json" ]; then
+            cp "$GENESIS_CONTRACT_DIR/account_alloc.json" "$GEN_CONFIG_DIR/debug_account_alloc.json"
+        fi
+        
+        log_info "Genesis generated at $OUTPUT_DIR/genesis.json"
+    else
+        log_error "Genesis generation failed."
+        exit 1
+    fi
+    
+    # Step 4: Generate waypoint
+    log_info "Step 4: Generating waypoint..."
+    "$LIQUENT_CLI" genesis generate-waypoint \
+        --input-file="$val_genesis_path" \
+        --output-file="$OUTPUT_DIR/waypoint.txt"
+    
+    echo ""
+    log_info "Genesis complete!"
+    log_info "Main artifacts:"
+    log_info "  - $OUTPUT_DIR/genesis.json"
+    log_info "  - $OUTPUT_DIR/waypoint.txt"
+    log_info "Config artifacts in: $GEN_CONFIG_DIR"
+    log_info "Run 'make deploy' next to deploy nodes."
+}
+
+main "$@"

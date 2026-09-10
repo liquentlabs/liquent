@@ -1,0 +1,69 @@
+# Liquent Cluster Configuration - VFN shadow topology
+# 1 validator (node1) + 1 VFN-alpha (shadow of node1) + 1 VFN-client
+# See _local/drafts/vfn-shadow/e2e.md §2-§4.
+
+[cluster]
+name = "liquent-devnet-vfn-shadow"
+base_dir = "/tmp/liquent-cluster-vfn-shadow"
+
+[genesis_source]
+genesis_path = "./artifacts/genesis.json"
+waypoint_path = "./artifacts/waypoint.txt"
+
+[[nodes]]
+id = "node1"
+role = "genesis"
+source = { project_path = "../" }
+host = "127.0.0.1"
+# internal_host = "10.0.1.10"   # optional: intra-cluster p2p address. Falls back to host when unset.
+validator_port = 6182
+vfn_port = 6192                 # still runs a local vfn server (not registered on-chain)
+rpc_port = 18545                # shifted from 8545 to avoid host-wide conflict with another user's anvil
+metrics_port = 9003
+inspection_port = 10002
+https_port = 1024
+authrpc_port = 8553
+reth_p2p_port = 12026
+# genesis registers shadow_fullnode = "vfn-alpha" (see genesis.toml). validator's
+# own vfn-network onchain discovery would resolve to vfn-alpha's identity → noise
+# pubkey mismatch self-check loop. Force vfn-network discovery off; the
+# validator_network keeps the default onchain.
+vfn_discovery_method = "none"
+
+[[nodes]]
+id = "vfn-alpha"
+role = "vfn"
+seeds = [
+    { from = "node1" },         # deploy.sh renders Vfn seeds pointing at node1's vfn_port
+]
+# On-chain discovery would produce (peer_id=node1.account_address, addr=vfn-alpha's own endpoint)
+# because node1's fullnode_address is registered with vfn-alpha's identity. The resulting dial
+# aims at 127.0.0.1:vfn_port — vfn-alpha itself — and only gets rejected at the Noise self-dial
+# guard (handshake.rs:346). Skip the pointless round-trip: seeds already cover the upstream.
+discovery_method = "none"
+source = { project_path = "../" }
+host = "127.0.0.1"
+vfn_port = 6193                 # on-chain fullnode_address points at this listener
+rpc_port = 18546
+metrics_port = 9004
+inspection_port = 10003
+https_port = 1025
+authrpc_port = 8554
+reth_p2p_port = 12027
+
+[[nodes]]
+id = "vfn-client"
+role = "vfn"
+# no seeds — standard VFN, reaches vfn-alpha via on-chain discovery
+source = { project_path = "../" }
+host = "127.0.0.1"
+vfn_port = 6194
+rpc_port = 18547
+metrics_port = 9005
+inspection_port = 10004
+https_port = 1026
+authrpc_port = 8555
+reth_p2p_port = 12028
+
+[faucet_init]
+num_accounts = 10000

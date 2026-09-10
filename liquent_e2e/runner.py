@@ -1,0 +1,551 @@
+import os
+import sys
+import subprocess
+import glob
+import time
+import signal
+import logging
+import argparse
+import shutil
+import errno
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # noqa: F811
+    except ImportError:
+        import toml as tomllib  # noqa: F811
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("LiquentRunner")
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+E2E_ROOT = PROJECT_ROOT / "liquent_e2e"
+TESTS_ROOT = E2E_ROOT / "cluster_test_cases"
+CLUSTER_SCRIPTS_DIR = PROJECT_ROOT / "cluster"
+LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def ensure_local_no_proxy(env):
+    """Ensure localhost RPC calls bypass user-configured HTTP proxies."""
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = env.get(key, "")
+        if existing.strip() == "*":
+            continue
+
+        parts = [part.strip() for part in existing.split(",") if part.strip()]
+        for host in LOCAL_NO_PROXY_HOSTS:
+            if host not in parts:
+                parts.append(host)
+        env[key] = ",".join(parts)
+
+
+def run_command(command, cwd=None, env=None, check=True, stream_output=True):
+    """Run a shell command and optionally stream output in real-time."""
+    logger.info(f"Running: {' '.join(command)}")
+    try:
+        if stream_output:
+            # Stream output in real-time (inherits parent's stdout/stderr)
+            result = subprocess.run(command, cwd=cwd, env=env, check=check, text=True)
+            return result.returncode == 0
+        else:
+            # Capture output (for cases where we need to process it)
+            result = subprocess.run(
+                command, cwd=cwd, env=env, check=check, capture_output=True, text=True
+            )
+            # Print stdout if any
+            if result.stdout:
+                for line in result.stdout.strip().split("\n"):
+                    if line:
+                        print(line)
+            return result.returncode == 0
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Command failed with exit code {e.returncode}")
+        if e.stdout:
+            logger.info("--- STDOUT ---")
+            for line in e.stdout.strip().split("\n"):
+                logger.info(line)
+        if e.stderr:
+            logger.error("--- STDERR ---")
+            for line in e.stderr.strip().split("\n"):
+                logger.error(line)
+        if check:
+            raise
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error running command: {type(e).__name__}: {e}")
+        import traceback
+
+        logger.error(traceback.format_exc())
+        raise
+
+
+def init_faucet_if_needed(test_dir: Path, cluster_config_path: Path, env: dict):
+    """
+    Check if cluster.toml requests faucet init, and run faucet.sh if so.
+    """
+    faucet_script = CLUSTER_SCRIPTS_DIR / "faucet.sh"
+    if not faucet_script.exists():
+        logger.warning("cluster/faucet.sh not found.")
+        return
+
+    with open(cluster_config_path, "rb") as f:
+        cfg = tomllib.load(f)
+    timeout_secs = cfg.get("faucet_init", {}).get("timeout_secs", 600)
+
+    logger.info(f"Checking/Running faucet init (timeout={timeout_secs}s)...")
+    run_command(
+        ["bash", str(faucet_script), str(cluster_config_path)],
+        cwd=CLUSTER_SCRIPTS_DIR,
+        env={**env, "FAUCET_RUN_TIMEOUT_SECS": str(timeout_secs)},
+        check=True,
+    )
+
+
+def cleanup_cluster():
+    """Kill any running liquent_node processes."""
+    logger.info("Cleaning up running nodes...")
+    # This is a bit aggressive but necessary for clean slate in docker
+    subprocess.run(["pkill", "-9", "liquent_node"], check=False)
+
+
+def verify_nodes_alive(cluster_config: Path, env: dict):
+    """
+    Verify all nodes are alive after startup by checking PID and RPC.
+    Fails fast if any node process has crashed (e.g. port conflict)
+    instead of letting tests run against dead nodes.
+    """
+    try:
+        import tomllib
+        with open(cluster_config, "rb") as f:
+            config = tomllib.load(f)
+    except ImportError:
+        import toml
+        with open(cluster_config, "r") as f:
+            config = toml.load(f)
+
+    base_dir = config.get("cluster", {}).get("base_dir", "")
+    nodes = config.get("nodes", [])
+    if not nodes:
+        return
+
+    dead_nodes = []
+    for node_cfg in nodes:
+        node_id = node_cfg["id"]
+        rpc_port = node_cfg.get("rpc_port")
+        data_dir = node_cfg.get("data_dir") or os.path.join(base_dir, node_id)
+        pid_file = os.path.join(data_dir, "script", "node.pid")
+
+        # 1. Check if process is alive
+        process_alive = False
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file) as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                process_alive = True
+            except ValueError:
+                pass
+            except ProcessLookupError:
+                pass
+            except OSError as e:
+                if e.errno == errno.EPERM:
+                    process_alive = True
+
+        if not process_alive:
+            log_dir = os.path.join(data_dir, "logs")
+            dead_nodes.append((node_id, f"process dead (check logs: {log_dir})"))
+            continue
+
+        # 2. Check if RPC is reachable
+        if rpc_port:
+            import urllib.request
+            import json as _json
+            url = f"http://127.0.0.1:{rpc_port}"
+            payload = _json.dumps(
+                {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+            ).encode()
+            req = urllib.request.Request(
+                url, data=payload, headers={"Content-Type": "application/json"}
+            )
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=5) as resp:
+                    body = _json.loads(resp.read())
+                    if "result" not in body:
+                        dead_nodes.append((node_id, f"RPC returned no result: {body}"))
+            except Exception as e:
+                dead_nodes.append((node_id, f"RPC unreachable at {url}: {e}"))
+
+    if dead_nodes:
+        details = "\n".join(f"  - {nid}: {reason}" for nid, reason in dead_nodes)
+        raise RuntimeError(
+            f"Node(s) failed to start:\n{details}\n"
+            f"Cluster cannot proceed. Fix the issue (e.g. port conflict) and retry."
+        )
+
+    logger.info(f"All {len(nodes)} node(s) verified alive and RPC-responsive.")
+
+
+def run_test_suite(
+    test_dir: Path,
+    no_cleanup: bool = False,
+    pytest_args: list = None,
+    force_init: bool = False,
+    resume: bool = False,
+):
+    """
+    Run tests in a specific directory.
+    """
+    cluster_config = test_dir / "cluster.toml"
+    genesis_config = test_dir / "genesis.toml"
+
+    if not cluster_config.exists():
+        logger.warning(f"No cluster.toml found in {test_dir}, skimming...")
+        return
+
+    logger.info(f"===== Running Suite: {test_dir.name} =====")
+
+    # Define artifact paths
+    suite_artifacts_dir = test_dir / "artifacts"
+    env = os.environ.copy()
+    ensure_local_no_proxy(env)
+    env["LIQUENT_ARTIFACTS_DIR"] = str(suite_artifacts_dir)
+
+    # Set genesis config path if it exists
+    if genesis_config.exists():
+        env["GENESIS_CONFIG_FILE"] = str(genesis_config)
+
+    # Load hooks if present (needed for both fresh and reuse modes)
+    hooks = None
+    hooks_path = test_dir / "hooks.py"
+    if hooks_path.exists():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hooks", hooks_path)
+        hooks = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hooks)
+
+    if resume:
+        # ── Reuse mode: skip cleanup/init/deploy/start, just run pytest ──
+        logger.info("♻️  Reuse-cluster mode: skipping environment setup, only running tests")
+    else:
+        # ── Fresh mode: full cleanup → init → deploy → start ──
+
+        # Always clean start unless specifically investigating
+        cleanup_cluster()
+
+        # Remove stale cluster data directory.
+        # deploy.sh has an interactive prompt that defaults to N in
+        # non-interactive mode, so we must clean it here.
+        import shutil
+        try:
+            import tomllib
+            with open(cluster_config, "rb") as f:
+                toml_data = tomllib.load(f)
+        except ImportError:
+            import toml
+            with open(cluster_config, "r") as f:
+                toml_data = toml.load(f)
+        base_dir = toml_data.get("cluster", {}).get("base_dir", "")
+        if base_dir and os.path.exists(base_dir):
+            logger.info(f"Removing stale cluster data at {base_dir}")
+            shutil.rmtree(base_dir)
+
+        # 1. Init Cluster (with Caching)
+        should_run_init = True
+
+        # Check if valid artifacts exist
+        if (
+            not force_init
+            and suite_artifacts_dir.exists()
+            and (suite_artifacts_dir / "genesis.json").exists()
+        ):
+            logger.info(f"Found cached artifacts in {suite_artifacts_dir}. Using cache.")
+            should_run_init = False
+
+        if should_run_init:
+            logger.info(
+                f"Initializing cluster (Generating artifacts in {suite_artifacts_dir})..."
+            )
+
+            # Step 1: init.sh (generate identity keys)
+            init_script = CLUSTER_SCRIPTS_DIR / "init.sh"
+            if genesis_config.exists():
+                run_command(
+                    ["bash", str(init_script), str(genesis_config)],
+                    cwd=CLUSTER_SCRIPTS_DIR,
+                    env=env,
+                )
+            else:
+                # Fallback to cluster.toml for backwards compatibility
+                run_command(
+                    ["bash", str(init_script), str(cluster_config)],
+                    cwd=CLUSTER_SCRIPTS_DIR,
+                    env=env,
+                )
+
+            # Step 2: genesis.sh (generate genesis.json)
+            genesis_script = CLUSTER_SCRIPTS_DIR / "genesis.sh"
+            if genesis_script.exists() and genesis_config.exists():
+                logger.info("Generating genesis...")
+                run_command(
+                    ["bash", str(genesis_script), str(genesis_config)],
+                    cwd=CLUSTER_SCRIPTS_DIR,
+                    env=env,
+                )
+
+        # 2. Deploy Cluster
+        logger.info("Deploying cluster...")
+        deploy_script = CLUSTER_SCRIPTS_DIR / "deploy.sh"
+
+        # Auto-detect per-test-case relayer config
+        custom_relayer_config = test_dir / "relayer_config.json"
+        if custom_relayer_config.exists():
+            env["RELAYER_CONFIG_TPL"] = str(custom_relayer_config)
+            logger.info(f"Using custom relayer config: {custom_relayer_config}")
+
+        # Auto-detect per-test-case reth config templates. Any test case can
+        # override the validator / vfn / pfn reth config (e.g. to enable
+        # pruning, mainnet hardening, …) simply by dropping a template file in
+        # its own directory — no change to the shared cluster/templates needed.
+        # This mirrors the relayer_config.json convention above; deploy.sh
+        # already reads these env vars (RETH_CONFIG_TPL / _VFN_TPL / _PFN_TPL).
+        # An explicitly exported env var still wins, so CI/manual overrides keep
+        # working.
+        reth_tpl_overrides = {
+            "reth_config.json.tpl": "RETH_CONFIG_TPL",          # validator
+            "reth_config_vfn.json.tpl": "RETH_CONFIG_VFN_TPL",  # VFN
+            "reth_config_pfn.json.tpl": "RETH_CONFIG_PFN_TPL",  # PFN
+        }
+        for tpl_name, env_var in reth_tpl_overrides.items():
+            tpl_path = test_dir / tpl_name
+            if tpl_path.exists() and env_var not in os.environ:
+                env[env_var] = str(tpl_path)
+                logger.info(f"Using custom reth config template: {env_var}={tpl_path}")
+
+        if hooks and hasattr(hooks, "pre_deploy"):
+            logger.info(f"Running pre_deploy hook from {hooks_path}")
+            hooks.pre_deploy(test_dir, env, pytest_args or [])
+
+        run_command(
+            ["bash", str(deploy_script), str(cluster_config)],
+            cwd=CLUSTER_SCRIPTS_DIR,
+            env=env,
+        )
+
+        # 2.5 Pre-start hook (e.g. start MockAnvil before node)
+        if hooks and hasattr(hooks, "pre_start"):
+            logger.info(f"Running pre_start hook from {hooks_path}")
+            hooks.pre_start(test_dir, env, pytest_args or [])
+
+        # 3. Start Nodes
+        start_script = CLUSTER_SCRIPTS_DIR / "start.sh"
+        if start_script.exists():
+            logger.info("Starting cluster nodes...")
+            # start.sh doesn't mostly need artifacts dir (it uses config from deploy),
+            # but passing env doesn't hurt.
+            run_command(
+                ["bash", str(start_script), "--config", str(cluster_config)],
+                cwd=CLUSTER_SCRIPTS_DIR,
+                env=env,
+            )
+
+            logger.info("Waiting 5s for nodes to warmup...")
+            time.sleep(5)
+
+            # Verify all nodes are actually alive after warmup.
+            # Catches early crashes (e.g. port conflicts) that start.sh's
+            # 1-second PID check cannot detect.
+            verify_nodes_alive(cluster_config, env)
+        else:
+            logger.error("cluster/start.sh missing, cannot start nodes!")
+            raise RuntimeError("Missing start.sh")
+
+        # 3.5 Faucet Initialization
+        init_faucet_if_needed(test_dir, cluster_config, env)
+
+    # 4. Run Pytests
+    logger.info(f"Running pytst in {test_dir}...")
+    success = False
+    try:
+        # We need to make sure liquent_e2e is in python path
+        # env already has LIQUENT_ARTIFACTS_DIR, but pytest might not need it
+        env["PYTHONPATH"] = f"{E2E_ROOT}:{env.get('PYTHONPATH', '')}"
+        env["LIQUENT_CLUSTER_CONFIG"] = str(cluster_config)
+
+        # Build pytest command
+        cmd = ["python3", "-m", "pytest", "-s", str(test_dir)]
+        if pytest_args:
+            cmd.extend(pytest_args)
+
+        run_command(cmd, cwd=E2E_ROOT, env=env)
+        logger.info(f"Suite {test_dir.name} PASSED")
+        success = True
+
+    except Exception as e:
+        logger.error(f"Suite {test_dir.name} FAILED: {e}")
+        raise
+    finally:
+        # 5. Teardown
+        if resume:
+            logger.info("♻️  Reuse-cluster mode: skipping teardown")
+        elif no_cleanup and not success:
+            logger.warning(
+                f"Test failed and --no-cleanup set. Cluster left running using config: {cluster_config}"
+            )
+            logger.warning("Run 'shutdown_cluster()' or kill manually when done.")
+        else:
+            stop_script = CLUSTER_SCRIPTS_DIR / "stop.sh"
+            if stop_script.exists():
+                run_command(
+                    ["bash", str(stop_script), "--config", str(cluster_config)],
+                    cwd=CLUSTER_SCRIPTS_DIR,
+                    env=env,
+                    check=False,
+                )
+
+            cleanup_cluster()
+
+        # Post-stop hook ALWAYS runs (e.g. stop MockAnvil).
+        # MockAnvil runs as a daemon thread in this process — it dies
+        # when we exit anyway, but explicit cleanup is cleaner and
+        # prevents the relayer from crashing on connection loss.
+        if not resume and hooks and hasattr(hooks, "post_stop"):
+            logger.info("Running post_stop hook...")
+            try:
+                hooks.post_stop(test_dir, env)
+            except Exception as e:
+                logger.warning(f"post_stop hook failed: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Liquent E2E Runner")
+    parser.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="Leave cluster running if tests fail (for debugging)",
+    )
+    parser.add_argument(
+        "--force-init",
+        action="store_true",
+        help="Force regeneration of cluster artifacts (ignore cache)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume with existing cluster: skip cleanup/init/deploy/start/stop, "
+             "only run pytest. Useful for re-running tests against an already deployed cluster.",
+    )
+    # Long-running suites excluded from CI by default.
+    # Run them explicitly: runner.py long_test
+    DEFAULT_EXCLUDES = [
+        "long_test",
+        "rolling_upgrade",
+        "oracle_live_soak",
+        "gamma_rolling_upgrade",
+    ]
+
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=None,
+        metavar="SUITE",
+        help="Exclude specific test suites by name (e.g. --exclude fuzzy_cluster). "
+             "Can be specified multiple times. "
+             "Always excludes: %(const)s",
+    )
+    # We use parse_known_args to let everything else slide through as potential pytest args or suites
+    args, unknown = parser.parse_known_args()
+
+    try:
+        # Discover test directories
+        all_test_dirs = [p for p in TESTS_ROOT.iterdir() if p.is_dir()]
+
+        # Smart separation of suites vs pytest flags
+        # Anything starting with '-' is a pytest flag.
+        # Anything matching a directory name is a suite.
+        # Anything else is likely a pytest arg (e.g. regex for -k)
+
+        suites_to_run = []
+        pytest_args = []
+
+        # Iterate over unknown args (positionals + unparsed flags)
+        # Note: argparsing is tricky. We'll iterate simply.
+
+        for arg in unknown:
+            if arg.startswith("-"):
+                pytest_args.append(arg)
+                continue
+
+            # Check if it matches a suite name
+            matched_suite = None
+            for p in all_test_dirs:
+                if p.name == arg:
+                    matched_suite = p
+                    break
+
+            if matched_suite:
+                suites_to_run.append(matched_suite)
+            else:
+                # If not a suite, assume it's an argument to a previous flag (like 'test_foo' after '-k')
+                pytest_args.append(arg)
+
+        # If no specific suites named, run all (with excludes applied)
+        if not suites_to_run:
+            test_dirs = all_test_dirs
+            # Always include DEFAULT_EXCLUDES, plus any user-specified excludes.
+            all_excludes = set(DEFAULT_EXCLUDES)
+            if args.exclude:
+                all_excludes.update(args.exclude)
+            test_dirs = [d for d in test_dirs if d.name not in all_excludes]
+            logger.info(f"Excluded suites: {sorted(all_excludes)}")
+        else:
+            test_dirs = suites_to_run
+
+        if not test_dirs:
+            logger.error("No valid test suites found to run.")
+            sys.exit(1)
+
+        logger.info(
+            f"Running {len(test_dirs)} test directories: {[t.name for t in test_dirs]}"
+        )
+        if pytest_args:
+            logger.info(f"Forwarding args to pytest: {pytest_args}")
+
+        failed_suites = []
+
+        for test_dir in sorted(test_dirs):
+            # Skip __pycache__ etc
+            if test_dir.name.startswith("__") or test_dir.name.startswith("."):
+                continue
+
+            try:
+                run_test_suite(
+                    test_dir,
+                    no_cleanup=args.no_cleanup,
+                    pytest_args=pytest_args,
+                    force_init=args.force_init,
+                    resume=args.resume,
+                )
+            except Exception:
+                logger.exception(f"Suite {test_dir.name} failed with exception:")
+                failed_suites.append(test_dir.name)
+
+        if failed_suites:
+            logger.error(f"The following suites failed: {failed_suites}")
+            sys.exit(1)
+
+        logger.info("All suites passed!")
+
+    except Exception as e:
+        logger.exception("Global runner failure")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

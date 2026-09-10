@@ -1,0 +1,318 @@
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+use crate::network::extract_network_ids;
+use aptos_consensus::{
+    consensusdb::{BlockNumberSchema, ConsensusDB},
+    liquent_state_computer::ConsensusAdapterArgs,
+    network_interface::ConsensusMsg,
+    persistent_liveness_storage::StorageWriteProxy,
+    quorum_store::quorum_store_db::QuorumStoreDB,
+};
+
+use block_buffer_manager::{get_block_buffer_manager, TxPool};
+use laptos::{
+    api_types::u256_define::BlockId,
+    aptos_channels::{aptos_channel, message_queues::QueueStyle},
+    aptos_config::config::NodeConfig,
+    aptos_dkg_runtime::{start_dkg_runtime, DKGMessage},
+    aptos_event_notifications::{
+        DbBackedOnChainConfig, EventNotificationListener, ReconfigNotificationListener,
+    },
+    aptos_logger::info,
+    aptos_network::{
+        protocols::network::{NetworkApplicationConfig, NetworkClientConfig, NetworkServiceConfig},
+        ProtocolId,
+    },
+};
+
+use aptos_mempool::{
+    core_mempool::{AdmitHandle, CoreMempool},
+    MempoolClientRequest, MempoolSyncMsg, QuorumStoreRequest,
+};
+use futures::channel::mpsc::{Receiver, Sender};
+use laptos::{
+    aptos_consensus_notifications::ConsensusNotifier,
+    aptos_crypto::{hash::GENESIS_BLOCK_ID, HashValue},
+    aptos_event_notifications::EventSubscriptionService,
+    aptos_mempool_notifications::MempoolNotificationListener,
+    aptos_network::application::{
+        interface::{NetworkClient, NetworkServiceEvents},
+        storage::PeersAndMetadata,
+    },
+    aptos_storage_interface::DbReaderWriter,
+    aptos_validator_transaction_pool::VTxnPoolState,
+};
+use tokio::runtime::Runtime;
+
+const RECENT_BLOCKS_RANGE: u64 = 256;
+
+pub struct ApplicationNetworkInterfaces<T> {
+    pub network_client: NetworkClient<T>,
+    pub network_service_events: NetworkServiceEvents<T>,
+}
+
+pub fn check_bootstrap_config(node_config_path: Option<PathBuf>) -> NodeConfig {
+    // Get the config file path
+    let config_path = node_config_path.expect("Config is required to launch node");
+    if !config_path.exists() {
+        panic!(
+            "The node config file could not be found! Ensure the given path is correct: {:?}",
+            config_path.display()
+        )
+    }
+
+    // A config file exists, attempt to parse the config
+    NodeConfig::load_from_path(config_path.clone()).unwrap_or_else(|error| {
+        panic!(
+            "Failed to load the node config file! Given file path: {:?}. Error: {:?}",
+            config_path.display(),
+            error
+        )
+    })
+}
+
+pub fn dkg_network_configuration(node_config: &NodeConfig) -> NetworkApplicationConfig {
+    let direct_send_protocols: Vec<ProtocolId> =
+        laptos::aptos_dkg_runtime::network_interface::DIRECT_SEND.into();
+    let rpc_protocols: Vec<ProtocolId> = laptos::aptos_dkg_runtime::network_interface::RPC.into();
+
+    let network_client_config =
+        NetworkClientConfig::new(direct_send_protocols.clone(), rpc_protocols.clone());
+    let network_service_config = NetworkServiceConfig::new(
+        direct_send_protocols,
+        rpc_protocols,
+        aptos_channel::Config::new(node_config.dkg.max_network_channel_size)
+            .queue_style(QueueStyle::FIFO),
+    );
+    NetworkApplicationConfig::new(network_client_config, network_service_config)
+}
+
+/// Spawns a new thread for the node inspection service
+pub fn start_node_inspection_service(
+    node_config: &NodeConfig,
+    peers_and_metadata: Arc<PeersAndMetadata>,
+) {
+    laptos::aptos_inspection_service::start_inspection_service(
+        node_config.clone(),
+        None,
+        peers_and_metadata,
+    )
+}
+
+/// Creates and starts the DKG runtime (if enabled)
+pub fn create_dkg_runtime(
+    node_config: &mut NodeConfig,
+    event_subscription_service: &mut EventSubscriptionService,
+    dkg_network_interfaces: Option<ApplicationNetworkInterfaces<DKGMessage>>,
+    vtxn_pool: &VTxnPoolState,
+) -> Option<Runtime> {
+    let dkg_subscriptions = if node_config.base.role.is_validator() {
+        let reconfig_events = event_subscription_service
+            .subscribe_to_reconfigurations()
+            .expect("DKG must subscribe to reconfigurations");
+        let dkg_start_events = event_subscription_service
+            .subscribe_to_events(vec![], vec!["0x1::dkg::DKGStartEvent".to_string()])
+            .expect("Consensus must subscribe to DKG events");
+        Some((reconfig_events, dkg_start_events))
+    } else {
+        None
+    };
+    let dkg_runtime = match dkg_network_interfaces {
+        Some(interfaces) => {
+            let ApplicationNetworkInterfaces { network_client, network_service_events } =
+                interfaces;
+            let (reconfig_events, dkg_start_events) = dkg_subscriptions
+                .expect("DKG needs to listen to NewEpochEvents events and DKGStartEvents");
+            let my_addr = node_config.validator_network.as_ref().unwrap().peer_id();
+            let rb_config = node_config.consensus.rand_rb_config.clone();
+            let dkg_runtime = start_dkg_runtime(
+                my_addr,
+                &node_config.consensus.safety_rules,
+                network_client,
+                network_service_events,
+                reconfig_events,
+                dkg_start_events,
+                vtxn_pool.clone(),
+                rb_config,
+                node_config.randomness_override_seq_num,
+            );
+            Some(dkg_runtime)
+        }
+        _ => None,
+    };
+
+    dkg_runtime
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_consensus(
+    node_config: &NodeConfig,
+    event_subscription_service: &mut EventSubscriptionService,
+    consensus_network_interfaces: ApplicationNetworkInterfaces<ConsensusMsg>,
+    consensus_notifier: ConsensusNotifier,
+    consensus_to_mempool_sender: Sender<QuorumStoreRequest>,
+    db: DbReaderWriter,
+    arg: &mut ConsensusAdapterArgs,
+    vtxn_pool: VTxnPoolState,
+) -> (Runtime, Arc<StorageWriteProxy>, Arc<QuorumStoreDB>) {
+    let consensus_reconfig_subscription = event_subscription_service
+        .subscribe_to_reconfigurations()
+        .expect("Consensus must subscribe to reconfigurations");
+    // TODO(liquent_byteyue: return quorum store client also)
+    aptos_consensus::consensus_provider::start_consensus(
+        node_config,
+        consensus_network_interfaces.network_client,
+        consensus_network_interfaces.network_service_events,
+        Arc::new(consensus_notifier),
+        consensus_to_mempool_sender,
+        db.clone(),
+        consensus_reconfig_subscription,
+        vtxn_pool,
+        None,
+        arg,
+    )
+}
+
+pub fn start_jwk_consensus_runtime(
+    node_config: &NodeConfig,
+    jwk_consensus_subscriptions: Option<(
+        ReconfigNotificationListener<DbBackedOnChainConfig>,
+        EventNotificationListener,
+    )>,
+    jwk_consensus_network_interfaces: Option<
+        ApplicationNetworkInterfaces<laptos::aptos_jwk_consensus::types::JWKConsensusMsg>,
+    >,
+    vtxn_pool: VTxnPoolState,
+) -> Runtime {
+    let jwk_consensus_runtime = match jwk_consensus_network_interfaces {
+        Some(interfaces) => {
+            let ApplicationNetworkInterfaces { network_client, network_service_events } =
+                interfaces;
+            let (reconfig_events, onchain_jwk_updated_events) = jwk_consensus_subscriptions.expect(
+                "JWK consensus needs to listen to NewEpochEvents and OnChainJWKMapUpdated events.",
+            );
+            let my_addr = node_config.validator_network.as_ref().unwrap().peer_id();
+            let jwk_consensus_runtime = laptos::aptos_jwk_consensus::start_jwk_consensus_runtime(
+                my_addr,
+                &node_config.consensus.safety_rules,
+                network_client,
+                network_service_events,
+                reconfig_events,
+                onchain_jwk_updated_events,
+                vtxn_pool.clone(),
+            );
+            Some(jwk_consensus_runtime)
+        }
+        _ => None,
+    };
+    jwk_consensus_runtime.expect("JWK consensus runtime must be started")
+}
+
+pub fn init_jwk_consensus(
+    node_config: &NodeConfig,
+    event_subscription_service: &mut EventSubscriptionService,
+    jwk_consensus_network_interfaces: ApplicationNetworkInterfaces<
+        laptos::aptos_jwk_consensus::types::JWKConsensusMsg,
+    >,
+    vtxn_pool: &VTxnPoolState,
+) -> Runtime {
+    // TODO(liquent): only valdiator should subscribe the reconf events
+    let reconfig_events = event_subscription_service
+        .subscribe_to_reconfigurations()
+        .expect("JWK consensus must subscribe to reconfigurations");
+    let jwk_updated_events = event_subscription_service
+        .subscribe_to_events(vec![], vec!["0x1::jwks::ObservedJWKsUpdated".to_string()])
+        .expect("JWK consensus must subscribe to DKG events");
+    start_jwk_consensus_runtime(
+        node_config,
+        Some((reconfig_events, jwk_updated_events)),
+        Some(jwk_consensus_network_interfaces),
+        vtxn_pool.clone(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn init_mempool(
+    node_config: &NodeConfig,
+    db: &DbReaderWriter,
+    event_subscription_service: &mut EventSubscriptionService,
+    mempool_interfaces: ApplicationNetworkInterfaces<MempoolSyncMsg>,
+    _mempool_client_receiver: Receiver<MempoolClientRequest>,
+    consensus_to_mempool_receiver: Receiver<QuorumStoreRequest>,
+    mempool_listener: MempoolNotificationListener,
+    peers_and_metadata: Arc<PeersAndMetadata>,
+    pool: Box<dyn TxPool>,
+) -> (Vec<Runtime>, AdmitHandle) {
+    let mempool_reconfig_subscription = event_subscription_service
+        .subscribe_to_reconfigurations()
+        .expect("Mempool must subscribe to reconfigurations");
+    let mempool = Box::new(CoreMempool::new(node_config, pool));
+    let admit_handle = mempool.admit_handle();
+    let runtime = aptos_mempool::bootstrap(
+        node_config,
+        Arc::clone(&db.reader),
+        mempool_interfaces.network_client,
+        mempool_interfaces.network_service_events,
+        _mempool_client_receiver,
+        consensus_to_mempool_receiver,
+        mempool_listener,
+        mempool_reconfig_subscription,
+        peers_and_metadata,
+        mempool,
+    );
+    (vec![runtime], admit_handle)
+}
+
+pub fn init_peers_and_metadata(
+    node_config: &NodeConfig,
+    _consensus_db: &Arc<ConsensusDB>,
+) -> Arc<PeersAndMetadata> {
+    let network_ids = extract_network_ids(node_config);
+
+    PeersAndMetadata::new(&network_ids)
+}
+
+pub async fn init_block_buffer_manager(
+    consensus_db: &Arc<ConsensusDB>,
+    latest_block_number: u64,
+) -> anyhow::Result<()> {
+    info!("init_block_buffer_manager start");
+    let start_block_number = latest_block_number.saturating_sub(RECENT_BLOCKS_RANGE);
+
+    let max_epoch = consensus_db.get_max_epoch();
+
+    let mut block_number_to_block_id = HashMap::new();
+    for epoch_i in (1..=max_epoch).rev() {
+        let start_key = (epoch_i, HashValue::zero());
+        let end_key = (epoch_i, HashValue::new([u8::MAX; HashValue::LENGTH]));
+        let results = consensus_db
+            .get_range_with_filter::<BlockNumberSchema, _>(
+                &start_key,
+                &end_key,
+                |(_, block_number)| {
+                    *block_number >= start_block_number && *block_number <= latest_block_number
+                },
+            )
+            .unwrap();
+        for ((epoch, block_id), block_number) in results {
+            block_number_to_block_id
+                .entry(block_number)
+                .or_insert_with(|| (epoch, BlockId::from_bytes(block_id.as_slice())));
+        }
+        if block_number_to_block_id.len() >= (latest_block_number - start_block_number + 1) as usize
+        {
+            break;
+        }
+    }
+    info!("init_block_buffer_manager get_max_epoch {}", max_epoch);
+
+    // Keep epoch information in block_number_to_block_id
+    if start_block_number == 0 {
+        block_number_to_block_id
+            .insert(0u64, (0, BlockId::from_bytes(GENESIS_BLOCK_ID.as_slice())));
+    }
+    get_block_buffer_manager()
+        .init(latest_block_number, block_number_to_block_id, max_epoch)
+        .await?;
+    Ok(())
+}

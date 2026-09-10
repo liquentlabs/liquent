@@ -1,0 +1,234 @@
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{
+    consensusdb::ConsensusDB, payload_client::user::quorum_store_client::QuorumStoreClient,
+};
+use anyhow::Result;
+use aptos_executor::block_executor::BlockExecutor;
+use aptos_executor_types::{BlockExecutorTrait, ExecutorError, ExecutorResult, StateComputeResult};
+use block_buffer_manager::{block_buffer_manager::BlockHashRef, get_block_buffer_manager};
+use laptos::{
+    api_types::u256_define::BlockId,
+    aptos_consensus::counters::{APTOS_COMMIT_BLOCKS, APTOS_EXECUTION_TXNS},
+    aptos_crypto::HashValue,
+    aptos_logger::{debug, error, info, warn},
+    aptos_types::{
+        block_executor::{config::BlockExecutorConfigFromOnchain, partitioner::ExecutableBlock},
+        ledger_info::LedgerInfoWithSignatures,
+    },
+};
+use std::sync::Arc;
+use tokio::runtime::Runtime;
+
+pub struct ConsensusAdapterArgs {
+    pub quorum_store_client: Option<Arc<QuorumStoreClient>>,
+    pub consensus_db: Option<Arc<ConsensusDB>>,
+}
+
+impl ConsensusAdapterArgs {
+    pub fn new(consensus_db: Arc<ConsensusDB>) -> Self {
+        Self { quorum_store_client: None, consensus_db: Some(consensus_db) }
+    }
+
+    pub fn set_quorum_store_client(&mut self, quorum_store_client: Option<Arc<QuorumStoreClient>>) {
+        self.quorum_store_client = quorum_store_client;
+    }
+
+    pub fn dummy() -> Self {
+        Self { quorum_store_client: None, consensus_db: None }
+    }
+}
+
+pub struct LiquentBlockExecutor {
+    inner: BlockExecutor,
+    consensus_db: Arc<ConsensusDB>,
+    // Option so Drop can take it and call `shutdown_background()`: the executor
+    // is dropped from async consensus tasks, where a plain Runtime drop panics.
+    runtime: Option<Runtime>,
+}
+
+impl LiquentBlockExecutor {
+    pub(crate) fn new(inner: BlockExecutor, consensus_db: Arc<ConsensusDB>) -> Self {
+        Self {
+            inner,
+            consensus_db,
+            runtime: Some(laptos::aptos_runtimes::spawn_named_runtime("tmp".into(), None)),
+        }
+    }
+
+    fn runtime(&self) -> &Runtime {
+        self.runtime.as_ref().expect("runtime is only taken on drop")
+    }
+}
+
+impl Drop for LiquentBlockExecutor {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl BlockExecutorTrait for LiquentBlockExecutor {
+    fn committed_block_id(&self) -> HashValue {
+        self.inner.committed_block_id()
+    }
+
+    fn reset(&self) -> Result<()> {
+        self.inner.reset()
+    }
+
+    fn execute_and_state_checkpoint(
+        &self,
+        block: ExecutableBlock,
+        parent_block_id: HashValue,
+        onchain_config: BlockExecutorConfigFromOnchain,
+    ) -> ExecutorResult<()> {
+        self.inner.execute_and_state_checkpoint(block, parent_block_id, onchain_config)
+    }
+
+    fn ledger_update(
+        &self,
+        block_id: HashValue,
+        parent_block_id: HashValue,
+    ) -> ExecutorResult<StateComputeResult> {
+        self.inner.ledger_update(block_id, parent_block_id)
+    }
+
+    fn commit_blocks(
+        &self,
+        block_ids: Vec<HashValue>,
+        ledger_info_with_sigs: LedgerInfoWithSignatures,
+    ) -> ExecutorResult<()> {
+        if !block_ids.is_empty() {
+            let (block_id, block_hash) = (
+                ledger_info_with_sigs.ledger_info().commit_info().id(),
+                ledger_info_with_sigs.ledger_info().block_hash(),
+            );
+            txn_metrics::TxnLifeTime::get_txn_life_time().record_block_committed(block_id.clone());
+            let block_num = ledger_info_with_sigs.ledger_info().block_number();
+            assert!(block_ids.last().unwrap().as_slice() == block_id.as_slice());
+            let len = block_ids.len();
+            if let Err(e) =
+                self.inner.db.writer.save_transactions(None, Some(&ledger_info_with_sigs), false)
+            {
+                error!("Failed to save_transactions in commit_blocks: {:?}", e);
+            }
+            let epoch = ledger_info_with_sigs.ledger_info().epoch();
+            self.runtime().block_on(async move {
+                let commit_blocks = block_ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, x)| {
+                        let mut v = [0u8; 32];
+                        v.copy_from_slice(block_hash.as_ref());
+                        BlockHashRef {
+                            block_id: BlockId::from_bytes(x.as_slice()),
+                            num: block_num - (len - 1 - i) as u64,
+                            hash: if x == block_id { Some(v) } else { None },
+                            persist_notifier: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let mut persist_notifiers = get_block_buffer_manager()
+                    .set_commit_blocks(&commit_blocks, epoch)
+                    .await
+                    .map_err(|e| {
+                        ExecutorError::internal_err(format!(
+                            "Failed to set commit blocks in BlockBufferManager: {e:?}"
+                        ))
+                    })?;
+                for notifier in persist_notifiers.iter_mut() {
+                    if notifier.recv().await.is_none() {
+                        warn!("persist_notifier channel closed in commit_blocks");
+                    }
+                }
+                Ok::<(), ExecutorError>(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) {
+        self.inner.finish()
+    }
+
+    fn pre_commit_block(&self, block_id: HashValue) -> ExecutorResult<()> {
+        Ok(())
+    }
+    fn commit_ledger(
+        &self,
+        block_ids: Vec<(HashValue, u64)>,
+        ledger_info_with_sigs: LedgerInfoWithSignatures,
+        randomness_data: Vec<(u64, Vec<u8>)>,
+    ) -> ExecutorResult<()> {
+        APTOS_COMMIT_BLOCKS.inc_by(block_ids.len() as u64);
+        info!("commit blocks: {:?}", block_ids);
+        let (block_id, block_hash) = (
+            ledger_info_with_sigs.ledger_info().commit_info().id(),
+            ledger_info_with_sigs.ledger_info().block_hash(),
+        );
+        assert!(!block_ids.is_empty(), "commit_ledger block_ids is empty");
+        let epoch = ledger_info_with_sigs.ledger_info().epoch();
+
+        // Persist randomness data
+        if !randomness_data.is_empty() {
+            let randomness_to_persist = if let Some(info) =
+                ledger_info_with_sigs.ledger_info().commit_info().epoch_block_info()
+            {
+                let epoch_change_block = info.block_number;
+                randomness_data
+                    .into_iter()
+                    .filter(|(num, _)| *num <= epoch_change_block)
+                    .collect::<Vec<_>>()
+            } else {
+                randomness_data
+            };
+
+            if !randomness_to_persist.is_empty() {
+                self.consensus_db
+                    .put_randomness(&randomness_to_persist)
+                    .map_err(|e| anyhow::anyhow!("Failed to persist randomness: {:?}", e))?;
+                debug!("Persisted randomness data: {:?}", randomness_to_persist);
+            }
+        }
+
+        self.runtime().block_on(async move {
+            let commit_blocks = block_ids
+                .into_iter()
+                .map(|(x, num)| {
+                    let mut v = [0u8; 32];
+                    v.copy_from_slice(block_hash.as_ref());
+                    BlockHashRef {
+                        block_id: BlockId::from_bytes(x.as_slice()),
+                        num,
+                        hash: if x == block_id { Some(v) } else { None },
+                        persist_notifier: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut persist_notifiers = get_block_buffer_manager()
+                .set_commit_blocks(&commit_blocks, epoch)
+                .await
+                .map_err(|e| {
+                    ExecutorError::internal_err(format!(
+                        "Failed to set commit blocks in BlockBufferManager: {e:?}"
+                    ))
+                })?;
+            for notifier in persist_notifiers.iter_mut() {
+                if notifier.recv().await.is_none() {
+                    warn!("persist_notifier channel closed in commit_ledger");
+                }
+            }
+            if let Err(e) =
+                self.inner.db.writer.save_transactions(None, Some(&ledger_info_with_sigs), false)
+            {
+                error!("Failed to save_transactions in commit_ledger: {:?}", e);
+            }
+            Ok::<(), ExecutorError>(())
+        })?;
+        Ok(())
+    }
+}

@@ -1,0 +1,1316 @@
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{
+    block_storage::{
+        block_tree::BlockTree,
+        pending_blocks::PendingBlocks,
+        tracing::{observe_block, BlockStage},
+        BlockReader,
+    },
+    payload_manager::TPayloadManager,
+    persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData, RootInfo},
+    pipeline::execution_client::TExecutionClient,
+    util::time_service::TimeService,
+};
+use anyhow::{bail, ensure, format_err, Context};
+use aptos_consensus_types::{
+    block::Block,
+    common::Round,
+    pipelined_block::{ExecutionSummary, PipelinedBlock},
+    quorum_cert::QuorumCert,
+    sync_info::SyncInfo,
+    timeout_2chain::TwoChainTimeoutCertificate,
+    wrapped_ledger_info::WrappedLedgerInfo,
+};
+use aptos_executor_types::StateComputeResult;
+use aptos_mempool::core_mempool::transaction::VerifiedTxn;
+use block_buffer_manager::{block_buffer_manager::BlockHashRef, get_block_buffer_manager};
+use futures::executor::block_on;
+use laptos::{
+    api_types::{
+        account::ExternalAccountAddress,
+        compute_res::ComputeRes,
+        u256_define::{BlockId, Random},
+        ExternalBlock, ExternalBlockMeta,
+    },
+    aptos_crypto::HashValue,
+    aptos_infallible::{Mutex, RwLock},
+    aptos_logger::prelude::*,
+    aptos_metrics_core::{register_int_gauge_vec, IntGaugeHelper, IntGaugeVec},
+    aptos_types::{
+        aggregate_signature::AggregateSignature,
+        jwks,
+        ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+        randomness::{RandMetadata, Randomness},
+        validator_txn::ValidatorTransaction,
+    },
+};
+use once_cell::sync::Lazy;
+
+#[cfg(test)]
+use std::collections::VecDeque;
+#[cfg(any(test, feature = "fuzzing"))]
+use std::sync::atomic::AtomicBool;
+#[cfg(any(test, feature = "fuzzing"))]
+use std::sync::atomic::Ordering;
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Read,
+    sync::Arc,
+    time::Duration,
+};
+
+use laptos::aptos_types::account_address::AccountAddress;
+
+use laptos::aptos_consensus::counters;
+
+#[cfg(test)]
+#[path = "block_store_test.rs"]
+mod block_store_test;
+
+#[path = "sync_manager.rs"]
+pub mod sync_manager;
+
+static CUR_RECOVER_BLOCK_NUMBER_GAUGE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aptos_current_recover_block_number",
+        "Current reccover block number",
+        &[]
+    )
+    .unwrap()
+});
+
+static RECOVERY_GAUGE: Lazy<IntGaugeVec> =
+    Lazy::new(|| register_int_gauge_vec!("aptos_recovery", "is recovery or not", &[]).unwrap());
+
+static SET_RANDOMNESS_FROM_DB_COUNTER: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "aptos_set_randomness_from_db_total",
+        "Total number of times randomness was set from DB",
+        &[]
+    )
+    .unwrap()
+});
+
+fn update_counters_for_ordered_blocks(ordered_blocks: &[Arc<PipelinedBlock>]) {
+    for block in ordered_blocks {
+        observe_block(block.block().timestamp_usecs(), BlockStage::ORDERED);
+    }
+}
+
+/// Responsible for maintaining all the blocks of payload and the dependencies of those blocks
+/// (parent and previous QC links).  It is expected to be accessed concurrently by multiple threads
+/// and is thread-safe.
+///
+/// Example tree block structure based on parent links.
+///                         ╭--> A3
+/// Genesis--> B0--> B1--> B2--> B3
+///             ╰--> C1--> C2
+///                         ╰--> D3
+///
+/// Example corresponding tree block structure for the QC links (must follow QC constraints).
+///                         ╭--> A3
+/// Genesis--> B0--> B1--> B2--> B3
+///             ├--> C1
+///             ├--------> C2
+///             ╰--------------> D3
+pub struct BlockStore {
+    inner: Arc<RwLock<BlockTree>>,
+    execution_client: Arc<dyn TExecutionClient>,
+    /// The persistent storage backing up the in-memory data structure, every write should go
+    /// through this before in-memory tree.
+    storage: Arc<dyn PersistentLivenessStorage>,
+    /// Used to ensure that any block stored will have a timestamp < the local time
+    time_service: Arc<dyn TimeService>,
+    // consistent with round type
+    vote_back_pressure_limit: Round,
+    payload_manager: Arc<dyn TPayloadManager>,
+    #[cfg(any(test, feature = "fuzzing"))]
+    back_pressure_for_test: AtomicBool,
+    order_vote_enabled: bool,
+    is_validator: bool,
+    pending_blocks: Arc<Mutex<PendingBlocks>>,
+    enable_randomness: bool,
+    require_block_randomness: bool,
+    /// Mapping from validator address to their index in the ordered validator set.
+    /// Used during recovery to compute proposer_index for blocks.
+    validator_indices: HashMap<AccountAddress, usize>,
+    /// Ephemeral, bounded metadata cache used by forward epoch sync. It is deliberately not
+    /// persisted: restart recovery is derived from the existing ConsensusDB schemas.
+    forward_epoch_sync_indexes: Mutex<HashMap<u64, Arc<sync_manager::ForwardEpochSyncIndex>>>,
+}
+
+impl BlockStore {
+    pub fn new(
+        storage: Arc<dyn PersistentLivenessStorage>,
+        initial_data: RecoveryData,
+        execution_client: Arc<dyn TExecutionClient>,
+        max_pruned_blocks_in_mem: usize,
+        time_service: Arc<dyn TimeService>,
+        vote_back_pressure_limit: Round,
+        payload_manager: Arc<dyn TPayloadManager>,
+        order_vote_enabled: bool,
+        is_validator: bool,
+        pending_blocks: Arc<Mutex<PendingBlocks>>,
+        enable_randomness: bool,
+        require_block_randomness: bool,
+        validator_indices: HashMap<AccountAddress, usize>,
+    ) -> Self {
+        let highest_2chain_tc = initial_data.highest_2chain_timeout_certificate();
+        let (root, blocks, quorum_certs) = initial_data.take();
+        info!("root {:?}", root);
+        let block_store = block_on(Self::build(
+            root,
+            blocks,
+            quorum_certs,
+            highest_2chain_tc,
+            execution_client,
+            storage,
+            max_pruned_blocks_in_mem,
+            time_service,
+            vote_back_pressure_limit,
+            payload_manager,
+            order_vote_enabled,
+            is_validator,
+            pending_blocks,
+            enable_randomness,
+            require_block_randomness,
+            validator_indices,
+        ));
+        block_on(block_store.recover_blocks());
+        block_store
+    }
+
+    pub async fn async_new(
+        storage: Arc<dyn PersistentLivenessStorage>,
+        initial_data: RecoveryData,
+        execution_client: Arc<dyn TExecutionClient>,
+        max_pruned_blocks_in_mem: usize,
+        time_service: Arc<dyn TimeService>,
+        vote_back_pressure_limit: Round,
+        payload_manager: Arc<dyn TPayloadManager>,
+        order_vote_enabled: bool,
+        is_validator: bool,
+        pending_blocks: Arc<Mutex<PendingBlocks>>,
+        enable_randomness: bool,
+        require_block_randomness: bool,
+        validator_indices: HashMap<AccountAddress, usize>,
+    ) -> Self {
+        let highest_2chain_tc = initial_data.highest_2chain_timeout_certificate();
+        let (root, blocks, quorum_certs) = initial_data.take();
+        info!("async_new root {:?}", root);
+        let block_store = Self::build(
+            root,
+            blocks,
+            quorum_certs,
+            highest_2chain_tc,
+            execution_client,
+            storage,
+            max_pruned_blocks_in_mem,
+            time_service,
+            vote_back_pressure_limit,
+            payload_manager,
+            order_vote_enabled,
+            is_validator,
+            pending_blocks,
+            enable_randomness,
+            require_block_randomness,
+            validator_indices,
+        )
+        .await;
+        block_store.recover_blocks().await;
+        if let Err(e) = block_store.replay_ordered_path_if_needed().await {
+            error!("replay ordered path after recovery failed: {e}");
+        }
+        block_store
+    }
+
+    fn find_the_last_ledger_info(
+        &self,
+        cur_round: u64,
+        round_to_ledger_infos: &BTreeMap<u64, LedgerInfoWithSignatures>,
+    ) -> LedgerInfoWithSignatures {
+        for i in (1..cur_round).rev() {
+            if let Some(li) = round_to_ledger_infos.get(&i) {
+                return li.clone();
+            }
+        }
+        LedgerInfoWithSignatures::new(LedgerInfo::dummy(), AggregateSignature::empty())
+    }
+
+    /// Replays uncommitted quorum certificates after a node restart.
+    ///
+    /// Retrieves all QCs with commit info from the block tree, sorts them by round,
+    /// and re-sends each one for execution in order. This reproduces the same commit
+    /// batches that were in-flight before the restart.
+    ///
+    /// If the latest ledger info carries `epoch_block_info` (indicating a non-blocking
+    /// epoch change was in progress), recovery stops at the epoch change block's round.
+    /// Suffix blocks beyond that point would never receive execution results from reth,
+    /// so attempting to recover them would cause the pipeline to hang.
+    async fn recover_blocks_checked(&self) -> anyhow::Result<()> {
+        RECOVERY_GAUGE.set_with(&[], 1);
+
+        let mut certs = self.inner.read().get_all_quorum_certs_with_commit_info();
+        let last_ledger_info =
+            self.storage.consensus_db().ledger_db.metadata_db().get_latest_ledger_info();
+        info!("recover_blocks: last_ledger_info={:?}", last_ledger_info);
+
+        // When a non-blocking epoch change was in progress, determine the epoch change
+        // block_number so that recovery does not commit suffix blocks past it.
+        let epoch_change_block_number = last_ledger_info.as_ref().and_then(|li| {
+            let info = li.ledger_info().commit_info().epoch_block_info()?;
+            info!(
+                "recover_blocks: epoch change detected at block_id={}, block_number={}",
+                info.block_id, info.block_number,
+            );
+            Some(info.block_number)
+        });
+
+        certs.sort_unstable_by_key(|qc| qc.commit_info().round());
+
+        for qc in certs {
+            let commit_round = qc.commit_info().round();
+
+            if commit_round <= self.commit_root().round() {
+                continue;
+            }
+
+            let Some(last_li) = &last_ledger_info else { continue };
+            if last_li.ledger_info().epoch() != qc.commit_info().epoch() ||
+                commit_round > last_li.commit_info().round()
+            {
+                continue;
+            }
+
+            info!(
+                "recover_blocks: sending round {} to execution (commit_root={})",
+                commit_round,
+                self.commit_root().round(),
+            );
+            if let Err(error) = self
+                .send_for_execution(qc.into_wrapped_ledger_info(), true, epoch_change_block_number)
+                .await
+            {
+                RECOVERY_GAUGE.set_with(&[], 0);
+                return Err(error).context("recover_blocks: failed to commit blocks");
+            }
+        }
+
+        RECOVERY_GAUGE.set_with(&[], 0);
+        Ok(())
+    }
+
+    async fn recover_blocks(&self) {
+        if let Err(error) = self.recover_blocks_checked().await {
+            RECOVERY_GAUGE.set_with(&[], 0);
+            error!(error = ?error, "Failed to recover consensus blocks");
+        }
+    }
+
+    pub(crate) async fn replay_ordered_path_if_needed(&self) -> anyhow::Result<()> {
+        let ordered_root_round = self.ordered_root().round();
+        let highest_ordered_cert = self.highest_ordered_cert().as_ref().clone();
+        let highest_ordered_round = highest_ordered_cert.commit_info().round();
+        if ordered_root_round < highest_ordered_round {
+            info!(
+                "[BlockStore] replay ordered path: ordered_root_round={}, highest_ordered_round={}",
+                ordered_root_round, highest_ordered_round,
+            );
+            self.send_for_execution(highest_ordered_cert, false, None).await?;
+        }
+        Ok(())
+    }
+
+    /// Check if there are blocks without randomness on the path from highest_ordered_cert to
+    /// highest_commit_cert
+    ///
+    /// Returns:
+    /// - (false, None): Fast return conditions are met, no sync needed
+    /// - (true, Some(cert)): Found the closest block to highest_commit_cert without randomness
+    /// - (false, Some(cert)): All blocks on path have randomness, use highest_commit_cert
+    ///
+    /// Fast return conditions:
+    /// - block randomness is not required
+    /// - in epoch 1
+    /// - ledger_info round is 0
+    pub fn find_missing_randomness_block_on_path(
+        &self,
+        ledger_info: &LedgerInfoWithSignatures,
+    ) -> (bool, Option<Arc<WrappedLedgerInfo>>) {
+        // Fast return: these conditions mean no special handling is needed
+        if !self.require_block_randomness ||
+            self.ordered_root().epoch() == 1 ||
+            ledger_info.commit_info().round() == 0
+        {
+            return (false, None);
+        }
+
+        // Start from highest_ordered_cert
+        let highest_ordered_cert = self.highest_ordered_cert();
+        let highest_ordered_block_id = highest_ordered_cert.commit_info().id();
+
+        // Get the starting block
+        let Some(mut cursor) = self.get_block(highest_ordered_block_id) else {
+            // If we can't find the highest ordered block, return highest_commit_cert
+            warn!(
+                "Cannot find highest ordered block {} (round {}), returning highest_commit_cert",
+                highest_ordered_block_id,
+                highest_ordered_cert.commit_info().round()
+            );
+            return (false, Some(self.highest_commit_cert()));
+        };
+
+        // Use highest_commit_cert instead of commit_root as the traversal endpoint
+        let highest_commit_cert = self.highest_commit_cert();
+        let commit_round = highest_commit_cert.commit_info().round();
+        let mut closest_block_without_randomness: Option<Arc<PipelinedBlock>> = None;
+
+        // Traverse the path from highest_ordered_cert to highest_commit_cert
+        loop {
+            if cursor.round() <= commit_round {
+                break;
+            }
+
+            // Record blocks without randomness (keep the one closest to highest_commit_cert)
+            if cursor.randomness().is_none() {
+                closest_block_without_randomness = Some(cursor.clone());
+            }
+
+            match self.get_block(cursor.parent_id()) {
+                Some(parent) => {
+                    cursor = parent;
+                }
+                None => break,
+            }
+        }
+
+        // If found a block without randomness
+        if let Some(block) = closest_block_without_randomness {
+            let highest_commit_cert = self.highest_commit_cert();
+            let cert = self
+                .get_quorum_cert_for_block(block.id())
+                .map(|qc| Arc::new(qc.into_wrapped_ledger_info()))
+                .unwrap_or_else(|| highest_commit_cert.clone());
+            // Guard against stale/placeholder commit_info (e.g. epoch 0, round 0) in QCs
+            // that haven't been executed yet. Never sync from before highest_commit_cert.
+            let cert = if cert.commit_info().round() < highest_commit_cert.commit_info().round() {
+                highest_commit_cert
+            } else {
+                cert
+            };
+            return (true, Some(cert));
+        }
+
+        // No block without randomness found, return highest_commit_cert
+        (false, Some(self.highest_commit_cert()))
+    }
+
+    async fn build(
+        root: RootInfo,
+        blocks: Vec<Block>,
+        quorum_certs: Vec<QuorumCert>,
+        highest_2chain_timeout_cert: Option<TwoChainTimeoutCertificate>,
+        execution_client: Arc<dyn TExecutionClient>,
+        storage: Arc<dyn PersistentLivenessStorage>,
+        max_pruned_blocks_in_mem: usize,
+        time_service: Arc<dyn TimeService>,
+        vote_back_pressure_limit: Round,
+        payload_manager: Arc<dyn TPayloadManager>,
+        order_vote_enabled: bool,
+        is_validator: bool,
+        pending_blocks: Arc<Mutex<PendingBlocks>>,
+        enable_randomness: bool,
+        require_block_randomness: bool,
+        validator_indices: HashMap<AccountAddress, usize>,
+    ) -> Self {
+        let RootInfo(root_block, root_qc, root_ordered_cert, root_commit_cert) = root;
+        let root_round = root_block.round();
+        let root_id = root_block.id();
+
+        let result = StateComputeResult::with_root_hash(root_block.id());
+
+        let pipelined_root_block = PipelinedBlock::new(
+            *root_block,
+            vec![],
+            // Create a dummy state_compute_result with necessary fields filled in.
+            result,
+        );
+
+        let tree = BlockTree::new(
+            pipelined_root_block,
+            root_qc,
+            root_ordered_cert,
+            root_commit_cert,
+            max_pruned_blocks_in_mem,
+            highest_2chain_timeout_cert.map(Arc::new),
+        );
+
+        let block_store = Self {
+            inner: Arc::new(RwLock::new(tree)),
+            execution_client,
+            storage,
+            time_service,
+            vote_back_pressure_limit,
+            payload_manager,
+            #[cfg(any(test, feature = "fuzzing"))]
+            back_pressure_for_test: AtomicBool::new(false),
+            order_vote_enabled,
+            is_validator,
+            pending_blocks,
+            enable_randomness,
+            require_block_randomness,
+            validator_indices,
+            forward_epoch_sync_indexes: Mutex::new(HashMap::new()),
+        };
+
+        // Skip ancestors of the root. They can appear in recovery data when an
+        // earlier sync path (e.g. sync_to_highest_commit_cert → fast_forward_sync
+        // with a lower-round HCC at the time) persisted historical blocks into
+        // ConsensusDB before the commit root advanced. The BlockTree only holds
+        // the root and its descendants — inserting an ancestor would fail with
+        // "Parent block not found" because its parent has already been pruned.
+        for block in blocks {
+            if block.round() <= root_round && block.id() != root_id {
+                continue;
+            }
+            if let Err(e) = block_store.insert_block(block.clone(), true).await {
+                warn!(
+                    "[BlockStore] skipping block during build: block={}, parent={}, error={:?}",
+                    block.id(),
+                    block.parent_id(),
+                    e
+                );
+            }
+        }
+        for qc in quorum_certs {
+            if qc.certified_block().round() < root_round {
+                continue;
+            }
+            if let Err(e) = block_store.insert_single_quorum_cert(qc.clone(), true) {
+                warn!(
+                    "[BlockStore] skipping quorum during build: certified_block={}, error={:?}",
+                    qc.certified_block().id(),
+                    e
+                );
+            }
+        }
+
+        counters::LAST_COMMITTED_ROUND.set(block_store.ordered_root().round() as i64);
+        block_store
+    }
+
+    pub fn init_block_number(&self, ordered_blocks: &Vec<Arc<PipelinedBlock>>) {
+        let mut block_numbers = vec![];
+        let mut block_number = 0;
+        for p_block in ordered_blocks {
+            if let Some(parent_block) = self.get_block(p_block.parent_id()) {
+                block_number = parent_block.block().block_number().unwrap() + 1;
+            } else if let Ok(Some(parent_block)) =
+                self.storage.consensus_db().get_block(p_block.epoch(), p_block.parent_id())
+            {
+                block_number = parent_block.block_number().unwrap() + 1;
+            } else {
+                panic!("Cannot find the parent_block id {}", p_block.parent_id());
+            }
+            if let Some(cur_block_number) = p_block.block().block_number() {
+                assert_eq!(cur_block_number, block_number);
+                continue;
+            }
+            info!("init block {}, block number is {}", p_block.block().id(), block_number);
+            p_block.block().set_block_number(block_number);
+            block_numbers.push((
+                p_block.block().epoch(),
+                p_block.block().block_number().unwrap(),
+                p_block.block().id(),
+            ));
+        }
+        if block_numbers.len() != 0 {
+            self.storage.save_tree(vec![], vec![], block_numbers).unwrap();
+        }
+    }
+
+    /// Send an ordered block id with the proof for execution, returns () on success or error
+    pub async fn send_for_execution(
+        &self,
+        finality_proof: WrappedLedgerInfo,
+        recovery: bool,
+        recover_epoch_change_block_number: Option<u64>,
+    ) -> anyhow::Result<()> {
+        if !self.is_validator && !recovery {
+            debug!("send_for_execution: skip live ordered execution for non-validator");
+            return Ok(());
+        }
+        let block_id_to_commit = finality_proof.commit_info().id();
+        // Idempotent short-circuits for concurrent send_for_execution races
+        // (e.g. recover_blocks vs. live consensus both advancing ordered_root).
+        // Each case means some other path already committed through this block,
+        // so returning Ok is correct. Logging is graded by likelihood of a real bug.
+        let block_to_commit = self
+            .get_block(block_id_to_commit)
+            .ok_or_else(|| format_err!("Committed block id not found"))?;
+        let ordered_root = self.ordered_root();
+        let commit_root = self.commit_root();
+        if block_to_commit.round() <= ordered_root.round() {
+            warn!(
+                "send_for_execution: committed block round lower than ordered root: \
+                block_to_commit_id={}, block_to_commit_round={}, \
+                ordered_root_id={}, ordered_root_round={}, \
+                commit_root_id={}, commit_root_round={}, recovery={}",
+                block_to_commit.id(),
+                block_to_commit.round(),
+                ordered_root.id(),
+                ordered_root.round(),
+                commit_root.id(),
+                commit_root.round(),
+                recovery,
+            );
+            return Err(format_err!(
+                "Committed block round lower than root: block_to_commit_round={}, ordered_root_round={}",
+                block_to_commit.round(),
+                ordered_root.round(),
+            ));
+        }
+        let blocks_to_commit = self.path_from_ordered_root(block_id_to_commit).unwrap_or_default();
+        if blocks_to_commit.is_empty() {
+            // Narrow race: ordered_root advanced between the round check above and here.
+            warn!(
+                "send_for_execution: no path from ordered_root to {} (round {}), likely concurrent advance",
+                block_id_to_commit,
+                block_to_commit.round()
+            );
+            return Ok(());
+        }
+        counters::SEND_TO_EXECUTION_BLOCK_COUNTER.inc_by(blocks_to_commit.len() as u64);
+        let block_tree = self.inner.clone();
+        let storage = self.storage.clone();
+        let finality_proof_clone = finality_proof.clone();
+        self.pending_blocks.lock().gc(finality_proof.commit_info().round());
+        // This callback is invoked synchronously with and could be used for multiple batches of
+        // blocks.
+        self.init_block_number(&blocks_to_commit);
+        if recovery {
+            // Recovery mode: process blocks directly without going through execution pipeline.
+            // Filter out suffix blocks past the epoch change boundary before execution.
+            let blocks_to_commit: Vec<_> = if let Some(limit) = recover_epoch_change_block_number {
+                let filtered: Vec<_> = blocks_to_commit
+                    .into_iter()
+                    .filter(|b| !b.block().block_number().is_some_and(|bn| bn > limit))
+                    .collect();
+                info!(
+                    "send_for_execution(recovery): filtered to {} blocks (epoch change limit={})",
+                    filtered.len(),
+                    limit,
+                );
+                if filtered.is_empty() {
+                    info!(
+                        "send_for_execution(recovery): all blocks filtered out by epoch change limit, skipping",
+                    );
+                    return Ok(());
+                }
+                filtered
+            } else {
+                blocks_to_commit
+            };
+            let last_block_number = blocks_to_commit
+                .last()
+                .and_then(|block| block.block().block_number())
+                .ok_or_else(|| format_err!("Block number not found for last recovery block"))?;
+            if self
+                .storage
+                .consensus_db()
+                .ledger_db
+                .metadata_db()
+                .get_block_hash(last_block_number)
+                .is_none()
+            {
+                info!(
+                    "send_for_execution(recovery): defer batch because last block has no ledger hash: block_number={}",
+                    last_block_number,
+                );
+                return Ok(());
+            }
+            let mut commit_blocks = vec![];
+            for p_block in &blocks_to_commit {
+                let mut txns = vec![];
+                loop {
+                    match self.payload_manager.get_transactions(p_block.block()).await {
+                        Ok((mut txns_, _)) => {
+                            txns.append(&mut txns_);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("get transaction error {}", e);
+                            if let Some(payload) = p_block.block().payload() {
+                                self.payload_manager.prefetch_payload_data(
+                                    payload,
+                                    p_block.block().timestamp_usecs(),
+                                );
+                            }
+                        }
+                    }
+                }
+                info!("recover block {}, txn_size: {}", p_block.block(), txns.len());
+                let verified_txns: Vec<VerifiedTxn> = txns.iter().map(|txn| txn.into()).collect();
+                let txn_num = verified_txns.len() as u64;
+                let verified_txns = verified_txns.into_iter().map(|txn| txn.into()).collect();
+                let block_number = p_block.block().block_number().ok_or_else(|| {
+                    format_err!("Block number not found for block {}", p_block.block().id())
+                })?;
+                let block_number_i64: i64 = block_number.try_into().map_err(|_| {
+                    format_err!("Block number {} is too large to convert to i64", block_number)
+                })?;
+                CUR_RECOVER_BLOCK_NUMBER_GAUGE.with_label_values(&[]).set(block_number_i64);
+                let maybe_block_hash = match self
+                    .storage
+                    .consensus_db()
+                    .ledger_db
+                    .metadata_db()
+                    .get_block_hash(block_number)
+                {
+                    Some(block_hash) => Some(ComputeRes::new(*block_hash, txn_num, vec![], vec![])),
+                    None => None,
+                };
+
+                let validator_txns = p_block.block().validator_txns();
+                let extra_data = crate::state_computer::process_validator_transactions_util(
+                    validator_txns.map(|v| &**v),
+                    p_block.block(),
+                );
+
+                // In recovery mode, use existing randomness from the block
+                let randomness = if self.require_block_randomness && p_block.epoch() != 1 {
+                    match p_block.randomness() {
+                        Some(r) => Some(Random::from_bytes(r.randomness())),
+                        None => {
+                            self.try_set_randomness_from_db(&p_block, p_block.block());
+                            match p_block.randomness() {
+                                Some(r) => Some(Random::from_bytes(r.randomness())),
+                                None => {
+                                    return Err(anyhow::anyhow!(
+                                        "Randomness is required but not found in block {}, block_number={}",
+                                        p_block.block().id(),
+                                        block_number,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Look up the proposer's index in the validator set (None for NIL blocks)
+                let proposer_index = p_block
+                    .block()
+                    .author()
+                    .and_then(|author| self.validator_indices.get(&author).copied())
+                    .map(|i| i as u64);
+
+                let block = ExternalBlock {
+                    txns: verified_txns,
+                    block_meta: ExternalBlockMeta {
+                        block_id: BlockId(*p_block.block().id()),
+                        block_number,
+                        usecs: p_block.block().timestamp_usecs(),
+                        epoch: p_block.block().epoch(),
+                        randomness,
+                        block_hash: maybe_block_hash.clone(),
+                        proposer_index,
+                        failed_proposer_indices: p_block
+                            .block()
+                            .block_data()
+                            .failed_authors()
+                            .map_or(vec![], |authors| {
+                                authors
+                                    .iter()
+                                    .filter_map(|(_round, author)| {
+                                        self.validator_indices.get(author).map(|i| *i as u64)
+                                    })
+                                    .collect()
+                            }),
+                    },
+                    extra_data,
+                    enable_randomness: self.enable_randomness,
+                };
+                get_block_buffer_manager()
+                    .set_ordered_blocks(BlockId(*p_block.parent_id()), block, p_block.round())
+                    .await
+                    .context("Failed to set ordered blocks during recovery")?;
+                let compute_res = get_block_buffer_manager()
+                    .get_executed_res(BlockId(*p_block.id()), block_number, p_block.block().epoch())
+                    .await
+                    .context(format!(
+                        "Failed to get executed result for block {} during recovery",
+                        p_block.block().id()
+                    ))?;
+                let compute_res = compute_res.execution_output;
+                commit_blocks.push(BlockHashRef {
+                    block_id: BlockId(*p_block.id()),
+                    num: block_number,
+                    hash: Some(compute_res.data),
+                    persist_notifier: None,
+                });
+                if let Some(block_hash) = maybe_block_hash {
+                    assert_eq!(block_hash.data, compute_res.data);
+                    let mut persist_notifiers = get_block_buffer_manager()
+                        .set_commit_blocks(&commit_blocks, p_block.block().epoch())
+                        .await
+                        .context("Failed to set commit blocks during recovery")?;
+                    for notifier in persist_notifiers.iter_mut() {
+                        let _ = notifier.recv().await;
+                    }
+                    commit_blocks.clear();
+                }
+            }
+            let commit_decision = finality_proof.ledger_info().clone();
+            block_tree.write().commit_callback(
+                storage,
+                &blocks_to_commit,
+                finality_proof,
+                commit_decision,
+            );
+            self.inner.write().update_ordered_root(block_to_commit.id());
+            self.inner.write().insert_ordered_cert(finality_proof_clone.clone());
+            update_counters_for_ordered_blocks(&blocks_to_commit);
+        } else {
+            // `BATCH_COMMIT_SIZE` env var: when set and the accumulated path is still
+            // small, defer sending so the execution layer can process blocks in larger
+            // batches. Because we return early without touching `ordered_root`, the next
+            // `send_for_execution` call will see the same root and `path_from_ordered_root`
+            // will grow until it exceeds the batch size, at which point we flush.
+            // Used by `liquent_e2e/cluster_test_cases/single_node/test_batch_exec.py`.
+            let batch_commit_size = std::env::var("BATCH_COMMIT_SIZE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if batch_commit_size > 0 && blocks_to_commit.len() <= batch_commit_size {
+                info!(
+                    "blocks_to_commit len {} <= BATCH_COMMIT_SIZE {}, skip sending for batch accumulation",
+                    blocks_to_commit.len(),
+                    batch_commit_size
+                );
+                return Ok(());
+            }
+
+            // Send blocks one by one: for each block, find the QC whose commit_info
+            // matches it. The QC that commits block[i] is the QC certifying block[i+1]
+            // (per 2-chain rule: QC(B_{i+1}).commit_info = B_i when rounds are consecutive).
+            // Blocks without a matching QC get batched with the next block that has one
+            // via path_from_ordered_root.
+            for (i, block) in blocks_to_commit.iter().enumerate() {
+                let proof = if block.id() == block_id_to_commit {
+                    // Last block: use the original finality_proof
+                    finality_proof.clone()
+                } else {
+                    // Look up the QC certifying the next block in the chain.
+                    // That QC's commit_info should point to this block (2-chain rule).
+                    let next_qc = (i + 1 < blocks_to_commit.len())
+                        .then(|| self.get_quorum_cert_for_block(blocks_to_commit[i + 1].id()))
+                        .flatten();
+                    match next_qc {
+                        Some(qc) if qc.commit_info().id() == block.id() => {
+                            qc.into_wrapped_ledger_info()
+                        }
+                        _ => {
+                            // No matching QC → this block will be included in the
+                            // next block's path_from_ordered_root batch.
+                            continue;
+                        }
+                    }
+                };
+
+                let path = self.path_from_ordered_root(block.id()).unwrap_or_default();
+                if path.is_empty() {
+                    continue;
+                }
+
+                let bt = self.inner.clone();
+                let st = self.storage.clone();
+                let proof_for_cb = proof.clone();
+
+                info!("send block to execution one-by-one {:?}", path);
+                self.execution_client
+                    .finalize_order(
+                        &path,
+                        proof.ledger_info().clone(),
+                        Box::new(
+                            move |committed_blocks: &[Arc<PipelinedBlock>],
+                                  commit_decision: LedgerInfoWithSignatures| {
+                                bt.write().commit_callback(
+                                    st,
+                                    committed_blocks,
+                                    proof_for_cb,
+                                    commit_decision,
+                                );
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("Failed to persist commit");
+
+                self.inner.write().update_ordered_root(block.id());
+                self.inner.write().insert_ordered_cert(proof);
+            }
+            update_counters_for_ordered_blocks(&blocks_to_commit);
+        }
+
+        Ok(())
+    }
+
+    pub async fn append_blocks_for_sync(
+        &self,
+        blocks: Vec<(Block, Option<u64>, Option<Vec<u8>>)>,
+        quorum_certs: Vec<QuorumCert>,
+    ) {
+        for (block, block_number, _) in blocks {
+            if let Some(num) = block_number {
+                if block.block_number().is_none() {
+                    block.set_block_number(num);
+                }
+            }
+            if let Err(e) = self.insert_block(block, true).await {
+                warn!("[BlockStore] skipping block during append blocks for sync: {:?}", e);
+            }
+        }
+        for qc in quorum_certs {
+            if let Err(e) = self.insert_single_quorum_cert(qc, true) {
+                warn!("[BlockStore] skipping quorum cert during append blocks for sync: {:?}", e);
+            }
+        }
+        self.recover_blocks().await;
+    }
+
+    pub async fn append_blocks_for_sync_checked(
+        &self,
+        blocks: Vec<(Block, Option<u64>, Option<Vec<u8>>)>,
+        quorum_certs: Vec<QuorumCert>,
+    ) -> anyhow::Result<()> {
+        for (block, block_number, _) in blocks {
+            if let Some(num) = block_number {
+                if block.block_number().is_none() {
+                    block.set_block_number(num);
+                }
+            }
+            self.insert_block(block, true).await.context("Failed to append forward-sync block")?;
+        }
+        for qc in quorum_certs {
+            self.insert_single_quorum_cert(qc, true).context("Failed to append forward-sync QC")?;
+        }
+        self.recover_blocks_checked().await
+    }
+
+    pub async fn rebuild(&self, root: RootInfo, blocks: Vec<Block>, quorum_certs: Vec<QuorumCert>) {
+        info!(
+            "Rebuilding block tree. root {:?}, blocks {:?}, qcs {:?}",
+            root,
+            blocks.iter().map(|b| b.id()).collect::<Vec<_>>(),
+            quorum_certs.iter().map(|qc| qc.certified_block().id()).collect::<Vec<_>>()
+        );
+        let max_pruned_blocks_in_mem = self.inner.read().max_pruned_blocks_in_mem();
+        // Rollover the previous highest TC from the old tree to the new one.
+        let prev_2chain_htc = self.highest_2chain_timeout_cert().map(|tc| tc.as_ref().clone());
+        let BlockStore { inner, .. } = Self::build(
+            root,
+            blocks,
+            quorum_certs,
+            prev_2chain_htc,
+            self.execution_client.clone(),
+            Arc::clone(&self.storage),
+            max_pruned_blocks_in_mem,
+            Arc::clone(&self.time_service),
+            self.vote_back_pressure_limit,
+            self.payload_manager.clone(),
+            self.order_vote_enabled,
+            self.is_validator,
+            self.pending_blocks.clone(),
+            self.enable_randomness,
+            self.require_block_randomness,
+            self.validator_indices.clone(),
+        )
+        .await;
+
+        // Unwrap the new tree and replace the existing tree.
+        *self.inner.write() = Arc::try_unwrap(inner)
+            .unwrap_or_else(|_| panic!("New block tree is not shared"))
+            .into_inner();
+        self.recover_blocks().await;
+    }
+
+    /// Insert a block if it passes all validation tests.
+    /// Returns the Arc to the block kept in the block store after persisting it to storage
+    ///
+    /// This function assumes that the ancestors are present (returns MissingParent otherwise).
+    ///
+    /// Duplicate inserts will return the previously inserted block (
+    /// note that it is considered a valid non-error case, for example, it can happen if a validator
+    /// receives a certificate for a block that is currently being added).
+    /// Try to load and set randomness from ConsensusDB if available
+    fn try_set_randomness_from_db(&self, pipelined_block: &PipelinedBlock, block: &Block) {
+        if !self.enable_randomness {
+            return;
+        }
+        if let Some(block_number) = block.block_number() {
+            if !pipelined_block.has_randomness() {
+                if let Ok(Some(randomness)) =
+                    self.storage.consensus_db().get_randomness(block_number)
+                {
+                    debug!(
+                        "Set randomness from DB for block {}, epoch {}, round {}: {:?}",
+                        block_number,
+                        block.epoch(),
+                        block.round(),
+                        randomness
+                    );
+                    SET_RANDOMNESS_FROM_DB_COUNTER.with_label_values(&[]).inc();
+                    pipelined_block.set_randomness(Randomness::new(
+                        RandMetadata { epoch: block.epoch(), round: block.round() },
+                        randomness,
+                    ));
+                } else {
+                    warn!(
+                        "No randomness found for block {}, epoch {}, round {}",
+                        block,
+                        block.epoch(),
+                        block.round()
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn insert_block(
+        &self,
+        block: Block,
+        rebuild: bool,
+    ) -> anyhow::Result<Arc<PipelinedBlock>> {
+        if let Some(existing_block) = self.get_block(block.id()) {
+            self.try_set_randomness_from_db(&existing_block, &block);
+            return Ok(existing_block);
+        }
+        info!("insert block {}", block);
+        if !rebuild {
+            ensure!(
+                self.inner.read().ordered_root().round() < block.round(),
+                "Block with old round"
+            );
+        }
+
+        let pipelined_block = PipelinedBlock::new_ordered(block.clone());
+        // set_randomness if it is available
+        self.try_set_randomness_from_db(&pipelined_block, &block);
+        // ensure local time past the block time
+        let block_time = Duration::from_micros(pipelined_block.timestamp_usecs());
+        let current_timestamp = self.time_service.get_current_timestamp();
+        if let Some(t) = block_time.checked_sub(current_timestamp) {
+            if t > Duration::from_secs(1) {
+                warn!("Long wait time {}ms for block {}", t.as_millis(), pipelined_block.block());
+            }
+            self.time_service.wait_until(block_time).await;
+        }
+        if let Some(payload) = pipelined_block.block().payload() {
+            self.payload_manager
+                .prefetch_payload_data(payload, pipelined_block.block().timestamp_usecs());
+        }
+        if !rebuild {
+            self.storage
+                .save_tree(vec![pipelined_block.block().clone()], vec![], vec![])
+                .context("Insert block failed when saving block")?;
+        }
+        self.inner.write().insert_block(pipelined_block)
+    }
+
+    /// Validates quorum certificates and inserts it into block tree assuming dependencies exist.
+    pub fn insert_single_quorum_cert(&self, qc: QuorumCert, rebuild: bool) -> anyhow::Result<()> {
+        debug!("insert qc {}", qc);
+        // If the parent block is not the root block (i.e not None), ensure the executed state
+        // of a block is consistent with its QuorumCert, otherwise persist the QuorumCert's
+        // state and on restart, a new execution will agree with it.  A new execution will match
+        // the QuorumCert's state on the next restart will work if there is a memory
+        // corruption, for example.
+        match self.get_block(qc.certified_block().id()) {
+            Some(pipelined_block) => {
+                ensure!(
+                    // decoupled execution allows dummy block infos
+                    pipelined_block.block_info().match_ordered_only(qc.certified_block()),
+                    "QC for block {} has different {:?} than local {:?}",
+                    qc.certified_block().id(),
+                    qc.certified_block(),
+                    pipelined_block.block_info()
+                );
+                observe_block(pipelined_block.block().timestamp_usecs(), BlockStage::QC_ADDED);
+            }
+            None => bail!("Insert {} without having the block in store first", qc),
+        };
+        if !rebuild {
+            self.storage
+                .save_tree(vec![], vec![qc.clone()], vec![])
+                .context("Insert block failed when saving quorum")?;
+        }
+        self.inner.write().insert_quorum_cert(qc)
+    }
+
+    /// Replace the highest 2chain timeout certificate in case the given one has a higher round.
+    /// In case a timeout certificate is updated, persist it to storage.
+    pub fn insert_2chain_timeout_certificate(
+        &self,
+        tc: Arc<TwoChainTimeoutCertificate>,
+    ) -> anyhow::Result<()> {
+        let cur_tc_round = self.highest_2chain_timeout_cert().map_or(0, |tc| tc.round());
+        if tc.round() <= cur_tc_round {
+            return Ok(());
+        }
+        self.storage
+            .save_highest_2chain_timeout_cert(tc.as_ref())
+            .context("Timeout certificate insert failed when persisting to DB")?;
+        self.inner.write().replace_2chain_timeout_cert(tc);
+        Ok(())
+    }
+
+    /// Prune the tree up to next_root_id (keep next_root_id's block).  Any branches not part of
+    /// the next_root_id's tree should be removed as well.
+    ///
+    /// For example, root = B0
+    /// B0--> B1--> B2
+    ///        ╰--> B3--> B4
+    ///
+    /// prune_tree(B3) should be left with
+    /// B3--> B4, root = B3
+    ///
+    /// Returns the block ids of the blocks removed.
+    #[cfg(test)]
+    fn prune_tree(&self, next_root_id: HashValue) -> VecDeque<(u64, HashValue)> {
+        let id_to_remove = self.inner.read().find_blocks_to_prune(next_root_id);
+        if let Err(e) = self.storage.prune_tree(id_to_remove.clone().into_iter().collect()) {
+            // it's fine to fail here, as long as the commit succeeds, the next restart will clean
+            // up dangling blocks, and we need to prune the tree to keep the root consistent with
+            // executor.
+            warn!(error = ?e, "fail to delete block");
+        }
+        // synchronously update both root_id and commit_root_id
+        let mut wlock = self.inner.write();
+        wlock.update_ordered_root(next_root_id);
+        wlock.update_commit_and_finalized_root(next_root_id);
+        wlock.process_pruned_blocks(id_to_remove.clone());
+        id_to_remove
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn set_back_pressure_for_test(&self, back_pressure: bool) {
+        self.back_pressure_for_test.store(back_pressure, Ordering::Relaxed)
+    }
+
+    pub fn pending_blocks(&self) -> Arc<Mutex<PendingBlocks>> {
+        self.pending_blocks.clone()
+    }
+
+    pub async fn wait_for_payload(&self, block: &Block) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(1), self.payload_manager.get_transactions(block))
+            .await??;
+        Ok(())
+    }
+
+    pub fn check_payload(&self, proposal: &Block) -> bool {
+        self.payload_manager.check_payload_availability(proposal)
+    }
+}
+
+impl BlockReader for BlockStore {
+    fn block_exists(&self, block_id: HashValue) -> bool {
+        self.inner.read().block_exists(&block_id)
+    }
+
+    fn get_block(&self, block_id: HashValue) -> Option<Arc<PipelinedBlock>> {
+        self.inner.read().get_block(&block_id)
+    }
+
+    fn ordered_root(&self) -> Arc<PipelinedBlock> {
+        self.inner.read().ordered_root()
+    }
+
+    fn commit_root(&self) -> Arc<PipelinedBlock> {
+        self.inner.read().commit_root()
+    }
+
+    fn get_quorum_cert_for_block(&self, block_id: HashValue) -> Option<Arc<QuorumCert>> {
+        self.inner.read().get_quorum_cert_for_block(&block_id)
+    }
+
+    fn path_from_ordered_root(&self, block_id: HashValue) -> Option<Vec<Arc<PipelinedBlock>>> {
+        self.inner.read().path_from_ordered_root(block_id)
+    }
+
+    fn path_from_commit_root(&self, block_id: HashValue) -> Option<Vec<Arc<PipelinedBlock>>> {
+        self.inner.read().path_from_commit_root(block_id)
+    }
+
+    #[cfg(test)]
+    fn highest_certified_block(&self) -> Arc<PipelinedBlock> {
+        self.inner.read().highest_certified_block()
+    }
+
+    fn highest_quorum_cert(&self) -> Arc<QuorumCert> {
+        self.inner.read().highest_quorum_cert()
+    }
+
+    fn highest_ordered_cert(&self) -> Arc<WrappedLedgerInfo> {
+        self.inner.read().highest_ordered_cert()
+    }
+
+    fn highest_commit_cert(&self) -> Arc<WrappedLedgerInfo> {
+        self.inner.read().highest_commit_cert()
+    }
+
+    fn highest_2chain_timeout_cert(&self) -> Option<Arc<TwoChainTimeoutCertificate>> {
+        self.inner.read().highest_2chain_timeout_cert()
+    }
+
+    fn sync_info(&self) -> SyncInfo {
+        SyncInfo::new_decoupled(
+            self.highest_quorum_cert().as_ref().clone(),
+            self.highest_ordered_cert().as_ref().clone(),
+            self.highest_commit_cert().as_ref().clone(),
+            self.highest_2chain_timeout_cert().map(|tc| tc.as_ref().clone()),
+        )
+    }
+
+    /// Return if the consensus is backpressured
+    fn vote_back_pressure(&self) -> bool {
+        #[cfg(any(test, feature = "fuzzing"))]
+        {
+            if self.back_pressure_for_test.load(Ordering::Relaxed) {
+                return true;
+            }
+        }
+        let commit_round = self.commit_root().round();
+        let ordered_round = self.ordered_root().round();
+        counters::OP_COUNTERS.gauge("back_pressure").set((ordered_round - commit_round) as i64);
+        ordered_round > self.vote_back_pressure_limit + commit_round
+    }
+
+    fn pipeline_pending_latency(&self, proposal_timestamp: Duration) -> Duration {
+        let ordered_root = self.ordered_root();
+        let commit_root = self.commit_root();
+        let pending_path = self.path_from_commit_root(self.ordered_root().id()).unwrap_or_default();
+        let pending_rounds = pending_path.len();
+        let oldest_not_committed = pending_path.into_iter().min_by_key(|b| b.round());
+
+        let oldest_not_committed_spent_in_pipeline = oldest_not_committed
+            .as_ref()
+            .and_then(|b| b.elapsed_in_pipeline())
+            .unwrap_or(Duration::ZERO);
+
+        let ordered_round = ordered_root.round();
+        let oldest_not_committed_round = oldest_not_committed.as_ref().map_or(0, |b| b.round());
+        let commit_round = commit_root.round();
+        let ordered_timestamp = Duration::from_micros(ordered_root.timestamp_usecs());
+        let oldest_not_committed_timestamp = oldest_not_committed
+            .as_ref()
+            .map(|b| Duration::from_micros(b.timestamp_usecs()))
+            .unwrap_or(Duration::ZERO);
+        let committed_timestamp = Duration::from_micros(commit_root.timestamp_usecs());
+        let commit_cert_timestamp =
+            Duration::from_micros(self.highest_commit_cert().commit_info().timestamp_usecs());
+
+        fn latency_from_proposal(proposal_timestamp: Duration, timestamp: Duration) -> Duration {
+            if timestamp.is_zero() {
+                // latency not known without non-genesis blocks
+                Duration::ZERO
+            } else {
+                proposal_timestamp.saturating_sub(timestamp)
+            }
+        }
+
+        let latency_to_committed = latency_from_proposal(proposal_timestamp, committed_timestamp);
+        let latency_to_oldest_not_committed =
+            latency_from_proposal(proposal_timestamp, oldest_not_committed_timestamp);
+        let latency_to_ordered = latency_from_proposal(proposal_timestamp, ordered_timestamp);
+
+        info!(
+            pending_rounds = pending_rounds,
+            ordered_round = ordered_round,
+            oldest_not_committed_round = oldest_not_committed_round,
+            commit_round = commit_round,
+            oldest_not_committed_spent_in_pipeline =
+                oldest_not_committed_spent_in_pipeline.as_millis() as u64,
+            latency_to_ordered_ms = latency_to_ordered.as_millis() as u64,
+            latency_to_oldest_not_committed = latency_to_oldest_not_committed.as_millis() as u64,
+            latency_to_committed_ms = latency_to_committed.as_millis() as u64,
+            latency_to_commit_cert_ms =
+                latency_from_proposal(proposal_timestamp, commit_cert_timestamp).as_millis() as u64,
+            "Pipeline pending latency on proposal creation",
+        );
+
+        counters::CONSENSUS_PROPOSAL_PENDING_ROUNDS.observe(pending_rounds as f64);
+        counters::CONSENSUS_PROPOSAL_PENDING_DURATION
+            .observe_duration(oldest_not_committed_spent_in_pipeline);
+
+        if pending_rounds > 1 {
+            // TODO cleanup
+            // previous logic was using difference between committed and ordered.
+            // keeping it until we test out the new logic.
+            // latency_to_oldest_not_committed
+            //     .saturating_sub(latency_to_ordered.min(MAX_ORDERING_PIPELINE_LATENCY_REDUCTION))
+
+            oldest_not_committed_spent_in_pipeline
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn get_recent_block_execution_times(&self, num_blocks: usize) -> Vec<ExecutionSummary> {
+        let mut res = vec![];
+        let mut cur_block = Some(self.ordered_root());
+        loop {
+            match cur_block {
+                Some(block) => {
+                    if let Some(execution_time_and_size) = block.get_execution_summary() {
+                        info!(
+                            "Found execution time for {}, {:?}",
+                            block.id(),
+                            execution_time_and_size
+                        );
+                        res.push(execution_time_and_size);
+                        if res.len() >= num_blocks {
+                            return res;
+                        }
+                    } else {
+                        info!("Couldn't find execution time for {}", block.id());
+                    }
+                    cur_block = self.get_block(block.parent_id());
+                }
+                None => return res,
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+impl BlockStore {
+    /// Returns the number of blocks in the tree
+    pub(crate) fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+
+    /// Returns the number of child links in the tree
+    pub(crate) fn child_links(&self) -> usize {
+        self.inner.read().child_links()
+    }
+
+    /// The number of pruned blocks that are still available in memory
+    pub(super) fn pruned_blocks_in_mem(&self) -> usize {
+        self.inner.read().pruned_blocks_in_mem()
+    }
+
+    /// Helper function to insert the block with the qc together
+    pub async fn insert_block_with_qc(&self, block: Block) -> anyhow::Result<Arc<PipelinedBlock>> {
+        self.insert_single_quorum_cert(block.quorum_cert().clone(), false)?;
+        if self.ordered_root().round() < block.quorum_cert().commit_info().round() {
+            self.send_for_execution(block.quorum_cert().into_wrapped_ledger_info(), false, None)
+                .await?;
+        }
+        self.insert_block(block, false).await
+    }
+}

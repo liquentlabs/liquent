@@ -1,0 +1,725 @@
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+#[cfg(test)]
+mod consensusdb_test;
+mod ledger_db;
+pub mod schema;
+
+use crate::error::DbError;
+use anyhow::Result;
+use aptos_consensus_types::{
+    block::Block, pipelined_block::PipelinedBlock, quorum_cert::QuorumCert,
+};
+use laptos::{
+    aptos_crypto::HashValue,
+    aptos_logger::prelude::*,
+    aptos_schemadb::{
+        batch::SchemaBatch,
+        schema::{KeyCodec, Schema},
+        Options, DB, DEFAULT_COLUMN_FAMILY_NAME,
+    },
+    aptos_storage_interface::AptosDbError,
+    aptos_types::randomness::{RandMetadata, Randomness},
+};
+use ledger_db::LedgerDb;
+use rocksdb::ReadOptions;
+use schema::{
+    block::BLOCK_NUMBER_CF_NAME,
+    single_entry::{SingleEntryKey, SingleEntrySchema},
+    BLOCK_CF_NAME, CERTIFIED_NODE_CF_NAME, DAG_VOTE_CF_NAME, EPOCH_BY_BLOCK_NUMBER_CF_NAME,
+    LEDGER_INFO_CF_NAME, NODE_CF_NAME, QC_CF_NAME, RANDOMNESS_CF_NAME, SINGLE_ENTRY_CF_NAME,
+};
+pub use schema::{
+    block::{BlockNumberSchema, BlockSchema},
+    dag::{CertifiedNodeSchema, DagVoteSchema, NodeSchema},
+    epoch_by_block_number::EpochByBlockNumberSchema,
+    ledger_info::LedgerInfoSchema,
+    quorum_certificate::QCSchema,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, HashMap},
+    iter::Iterator,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+/// The name of the consensus db file
+pub const CONSENSUS_DB_NAME: &str = "consensus_db";
+const RECENT_BLOCKS_RANGE: u64 = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommittedBlockAnchor {
+    pub block_number: u64,
+    pub timestamp_usecs: u64,
+    pub block_hash: HashValue,
+}
+
+/// Creates new physical DB checkpoint in directory specified by `checkpoint_path`.
+pub fn create_checkpoint<P: AsRef<Path> + Clone>(db_path: P, checkpoint_path: P) -> Result<()> {
+    let start = Instant::now();
+    let consensus_db_checkpoint_path = checkpoint_path.as_ref().join(CONSENSUS_DB_NAME);
+    std::fs::remove_dir_all(&consensus_db_checkpoint_path).unwrap_or(());
+    ConsensusDB::new(db_path, &PathBuf::new())
+        .db
+        .create_checkpoint(&consensus_db_checkpoint_path)?;
+    info!(
+        path = consensus_db_checkpoint_path,
+        time_ms = %start.elapsed().as_millis(),
+        "Made ConsensusDB checkpoint."
+    );
+    Ok(())
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LiquentNodeConfig {
+    pub consensus_public_key: String,
+    pub account_address: String,
+    pub network_public_key: String,
+    pub trusted_peers_map: Vec<String>,
+    pub public_ip_address: String,
+    pub voting_power: u64,
+}
+
+pub type LiquentNodeConfigSet = BTreeMap<String, LiquentNodeConfig>;
+
+/// Loads a config configuration file
+pub fn load_file(path: &Path) -> LiquentNodeConfigSet {
+    let contents = std::fs::read_to_string(path).unwrap();
+    serde_yaml::from_str(&contents).unwrap()
+}
+
+pub struct ConsensusDB {
+    db: Arc<DB>,
+    pub node_config_set: LiquentNodeConfigSet,
+    pub ledger_db: LedgerDb,
+}
+
+impl ConsensusDB {
+    pub fn new<P: AsRef<Path> + Clone>(db_root_path: P, node_config_path: &PathBuf) -> Self {
+        let column_families = vec![
+            /* UNUSED CF = */ DEFAULT_COLUMN_FAMILY_NAME,
+            BLOCK_CF_NAME,
+            QC_CF_NAME,
+            SINGLE_ENTRY_CF_NAME,
+            NODE_CF_NAME,
+            CERTIFIED_NODE_CF_NAME,
+            DAG_VOTE_CF_NAME,
+            LEDGER_INFO_CF_NAME,
+            BLOCK_NUMBER_CF_NAME,
+            EPOCH_BY_BLOCK_NUMBER_CF_NAME,
+            RANDOMNESS_CF_NAME,
+            "ordered_anchor_id", // deprecated CF
+        ];
+
+        let path = db_root_path.as_ref().join(CONSENSUS_DB_NAME);
+        println!("consensun path : {:?}", path);
+        let instant = Instant::now();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let db = Arc::new(
+            DB::open(path.clone(), "consensus", column_families, &opts)
+                .expect("ConsensusDB open failed; unable to continue"),
+        );
+
+        info!("Opened ConsensusDB at {:?} in {} ms", path, instant.elapsed().as_millis());
+        let mut node_config_set = BTreeMap::new();
+        if node_config_path.to_str().is_some() && !node_config_path.to_str().unwrap().is_empty() {
+            node_config_set = load_file(node_config_path.as_path());
+        }
+
+        let ledger_db = LedgerDb::new(db.clone());
+
+        Self { db, node_config_set, ledger_db }
+    }
+
+    /// Returns the newest committed execution block whose consensus round is no newer than
+    /// `target_round`. At the beginning of an epoch, the previous epoch's reconfiguration block
+    /// is used because its post-state contains the new validator set and reset performance data.
+    pub fn get_reputation_anchor(
+        &self,
+        target_epoch: u64,
+        target_round: u64,
+    ) -> Result<Option<CommittedBlockAnchor>> {
+        let mut iter = self.db.rev_iter::<LedgerInfoSchema>()?;
+        iter.seek_to_last();
+
+        while let Some((_block_number, ledger_info_with_sigs)) = iter.next().transpose()? {
+            let ledger_info = ledger_info_with_sigs.ledger_info();
+            let commit_info = ledger_info.commit_info();
+
+            if commit_info
+                .next_epoch_state()
+                .is_some_and(|next_epoch_state| next_epoch_state.epoch == target_epoch)
+            {
+                if let Some(epoch_block_info) = commit_info.epoch_block_info() {
+                    return Ok(Some(CommittedBlockAnchor {
+                        block_number: epoch_block_info.block_number,
+                        timestamp_usecs: epoch_block_info.epoch_start_timestamp_usecs,
+                        block_hash: epoch_block_info.block_hash,
+                    }));
+                }
+
+                // A boundary LI without EpochBlockInfo cannot distinguish the actual epoch-change
+                // block from a locally persisted suffix LI. Do not use local LI fields as
+                // leader-reputation consensus inputs.
+                continue;
+            }
+
+            // An epoch-ending block's post-state already belongs to the next epoch, so it must
+            // never be used as a performance snapshot for the epoch it ends.
+            if commit_info.next_epoch_state().is_none() &&
+                commit_info.epoch() == target_epoch &&
+                commit_info.round() <= target_round
+            {
+                return Ok(Some(CommittedBlockAnchor {
+                    block_number: ledger_info.block_number(),
+                    timestamp_usecs: ledger_info.timestamp_usecs(),
+                    block_hash: ledger_info.block_hash(),
+                }));
+            }
+
+            if commit_info.epoch().saturating_add(1) < target_epoch {
+                break;
+            }
+        }
+
+        Ok(None)
+    }
+
+    pub fn get_data(
+        &self,
+        latest_block_number: u64,
+        epoch: u64,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>, Vec<Block>, Vec<QuorumCert>, bool)> {
+        let mut has_root = false;
+        let last_vote = self.get_last_vote()?;
+        let highest_2chain_timeout_certificate = self.get_highest_2chain_timeout_certificate()?;
+        let start_key = (epoch, HashValue::zero());
+        let end_key = (epoch, HashValue::new([u8::MAX; HashValue::LENGTH]));
+
+        let block_number_to_block_id = self
+            .get_range_with_filter::<BlockNumberSchema, _>(
+                &start_key,
+                &end_key,
+                |(_, block_number)| *block_number >= latest_block_number,
+            )?
+            .into_iter()
+            .map(|((_, block_id), block_number)| (block_number, block_id))
+            .collect::<HashMap<u64, HashValue>>();
+        let (start_epoch, start_round, start_block_id) =
+            if block_number_to_block_id.contains_key(&latest_block_number) {
+                let block = self
+                    .get::<BlockSchema>(&(epoch, block_number_to_block_id[&latest_block_number]))?
+                    .unwrap();
+                has_root = true;
+                (block.epoch(), block.round(), block.id())
+            } else {
+                (epoch, 0, HashValue::zero())
+            };
+        let block_id_to_block_number = block_number_to_block_id
+            .iter()
+            .map(|(block_number, block_id)| (*block_id, *block_number))
+            .collect::<HashMap<HashValue, u64>>();
+        let mut consensus_blocks: Vec<_> = self
+            .get_range_with_filter::<BlockSchema, _>(&start_key, &end_key, |(_, block)| {
+                block.round() > start_round || block.id() == start_block_id
+            })?
+            .into_iter()
+            .map(|(_, block)| block)
+            .collect();
+        consensus_blocks.iter_mut().for_each(|block| {
+            if block.block_number().is_none() {
+                if let Some(block_number) = block_id_to_block_number.get(&block.id()) {
+                    block.set_block_number(*block_number);
+                }
+            }
+        });
+        let consensus_qcs: Vec<_> = self
+            .get_range_with_filter::<QCSchema, _>(&start_key, &end_key, |(_, qc)| {
+                qc.certified_block().round() > start_round ||
+                    qc.certified_block().id() == start_block_id
+            })?
+            .into_iter()
+            .map(|(_, qc)| qc)
+            .collect();
+        info!("consensus_blocks size : {}, consensus_qcs size : {}, block_number_to_block_id size : {}, start_round : {}",
+                 consensus_blocks.len(), consensus_qcs.len(), block_number_to_block_id.len(), start_round);
+        Ok((
+            last_vote,
+            highest_2chain_timeout_certificate,
+            consensus_blocks,
+            consensus_qcs,
+            has_root,
+        ))
+    }
+
+    pub fn save_highest_2chain_timeout_certificate(&self, tc: Vec<u8>) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        batch.put::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert, &tc)?;
+        self.commit(batch)?;
+        Ok(())
+    }
+
+    pub fn save_vote(&self, last_vote: Vec<u8>) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        batch.put::<SingleEntrySchema>(&SingleEntryKey::LastVote, &last_vote)?;
+        self.commit(batch)
+    }
+
+    pub fn save_blocks_and_quorum_certificates(
+        &self,
+        block_data: Vec<Block>,
+        qc_data: Vec<QuorumCert>,
+    ) -> Result<(), DbError> {
+        if block_data.is_empty() && qc_data.is_empty() {
+            return Ok(());
+        }
+        let mut batch = SchemaBatch::new();
+        block_data
+            .iter()
+            .try_for_each(|block| batch.put::<BlockSchema>(&(block.epoch(), block.id()), block))?;
+        qc_data.iter().try_for_each(|qc| {
+            batch.put::<QCSchema>(&(qc.certified_block().epoch(), qc.certified_block().id()), qc)
+        })?;
+        self.commit(batch)
+    }
+
+    pub fn save_block_numbers(
+        &self,
+        block_numbers: Vec<(u64, u64, HashValue)>,
+    ) -> Result<(), DbError> {
+        if block_numbers.is_empty() {
+            return Ok(());
+        }
+        let mut batch = SchemaBatch::new();
+        block_numbers.iter().try_for_each(|(epoch, block_number, block_id)| {
+            batch.put::<BlockNumberSchema>(&(*epoch, *block_id), block_number)
+        })?;
+        self.commit(batch)
+    }
+
+    pub fn delete_blocks_and_quorum_certificates(
+        &self,
+        block_keys: Vec<(u64, HashValue)>,
+    ) -> Result<(), DbError> {
+        if block_keys.is_empty() {
+            return Err(anyhow::anyhow!("Consensus block ids is empty!").into());
+        }
+        let mut batch = SchemaBatch::new();
+        block_keys.iter().try_for_each(|hash| {
+            batch.delete::<BlockSchema>(hash)?;
+            batch.delete::<QCSchema>(hash)
+        })?;
+        self.commit(batch)
+    }
+
+    /// Write the whole schema batch including all data necessary to mutate the ledger
+    /// state of some transaction by leveraging rocksdb atomicity support.
+    fn commit(&self, batch: SchemaBatch) -> Result<(), DbError> {
+        self.db.write_schemas(batch)?;
+        Ok(())
+    }
+
+    /// Get latest timeout certificates (we only store the latest highest timeout certificates).
+    fn get_highest_2chain_timeout_certificate(&self) -> Result<Option<Vec<u8>>, DbError> {
+        Ok(self.db.get::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert)?)
+    }
+
+    pub fn delete_highest_2chain_timeout_certificate(&self) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        batch.delete::<SingleEntrySchema>(&SingleEntryKey::Highest2ChainTimeoutCert)?;
+        self.commit(batch)
+    }
+
+    /// Get serialized latest vote (if available)
+    fn get_last_vote(&self) -> Result<Option<Vec<u8>>, DbError> {
+        Ok(self.db.get::<SingleEntrySchema>(&SingleEntryKey::LastVote)?)
+    }
+
+    pub fn delete_last_vote_msg(&self) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        batch.delete::<SingleEntrySchema>(&SingleEntryKey::LastVote)?;
+        self.commit(batch)?;
+        Ok(())
+    }
+
+    pub fn put<S: Schema>(&self, key: &S::Key, value: &S::Value) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        batch.put::<S>(key, value)?;
+        self.commit(batch)?;
+        Ok(())
+    }
+
+    pub fn delete<S: Schema>(&self, keys: Vec<S::Key>) -> Result<(), DbError> {
+        let mut batch = SchemaBatch::new();
+        keys.iter().try_for_each(|key| batch.delete::<S>(key))?;
+        self.commit(batch)
+    }
+
+    pub fn get_all<S: Schema>(&self) -> Result<Vec<(S::Key, S::Value)>, DbError> {
+        let mut iter = self.db.iter::<S>()?;
+        iter.seek_to_first();
+        Ok(iter.collect::<Result<Vec<(S::Key, S::Value)>, AptosDbError>>()?)
+    }
+
+    pub fn get<S: Schema>(&self, key: &S::Key) -> Result<Option<S::Value>, DbError> {
+        Ok(self.db.get::<S>(key)?)
+    }
+
+    pub fn get_range<S: Schema>(
+        &self,
+        start_key: &S::Key,
+        end_key: &S::Key,
+    ) -> Result<Vec<(S::Key, S::Value)>, DbError> {
+        let mut option = ReadOptions::default();
+        let lower_bound = <S::Key as KeyCodec<S>>::encode_key(start_key).unwrap();
+        option.set_iterate_lower_bound(lower_bound);
+        let upper_bound = <S::Key as KeyCodec<S>>::encode_key(end_key).unwrap();
+        option.set_iterate_upper_bound(upper_bound);
+        let mut iter = self.db.iter_with_opts::<S>(option)?;
+        iter.seek_to_first();
+        Ok(iter.collect::<Result<Vec<(S::Key, S::Value)>, AptosDbError>>()?)
+    }
+
+    pub fn get_range_with_filter<S: Schema, F>(
+        &self,
+        start_key: &S::Key,
+        end_key: &S::Key,
+        filter: F,
+    ) -> Result<Vec<(S::Key, S::Value)>, DbError>
+    where
+        F: FnMut(&(S::Key, S::Value)) -> bool,
+    {
+        let mut option = ReadOptions::default();
+        let lower_bound = <S::Key as KeyCodec<S>>::encode_key(start_key).unwrap();
+        option.set_iterate_lower_bound(lower_bound);
+        let upper_bound = <S::Key as KeyCodec<S>>::encode_key(end_key).unwrap();
+        option.set_iterate_upper_bound(upper_bound);
+        let mut iter = self.db.iter_with_opts::<S>(option)?;
+        iter.seek_to_first();
+        Ok(iter
+            .collect::<Result<Vec<(S::Key, S::Value)>, AptosDbError>>()?
+            .into_iter()
+            .filter(filter)
+            .collect())
+    }
+
+    pub fn get_block(&self, epoch: u64, block_id: HashValue) -> Result<Option<Block>, DbError> {
+        let block = self.get::<BlockSchema>(&(epoch, block_id))?;
+        if let Some(block) = &block {
+            if block.block_number().is_none() {
+                let block_number = self.get::<BlockNumberSchema>(&(epoch, block_id))?;
+                match block_number {
+                    Some(block_number) => {
+                        info!(
+                            "get block number from db, block id is {}, block number is {}",
+                            block.id(),
+                            block_number
+                        );
+                        block.set_block_number(block_number)
+                    }
+                    None => (),
+                }
+            }
+        }
+        Ok(block)
+    }
+
+    pub fn get_qc(&self, epoch: u64, block_id: HashValue) -> Result<Option<QuorumCert>, DbError> {
+        self.get::<QCSchema>(&(epoch, block_id))
+    }
+
+    pub fn get_qc_range(
+        &self,
+        start_key: &(u64, HashValue),
+        end_key: &(u64, HashValue),
+    ) -> Result<Vec<QuorumCert>, DbError> {
+        Ok(self
+            .get_range::<QCSchema>(start_key, end_key)?
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect())
+    }
+
+    pub fn get_max_epoch(&self) -> u64 {
+        let mut iter = self.db.rev_iter::<BlockSchema>().unwrap();
+        iter.seek_to_last();
+        let max_epoch = match iter.next() {
+            Some(Ok(((epoch, _), _))) => epoch,
+            _ => 1,
+        };
+        max_epoch
+    }
+
+    /// Store randomness data for blocks
+    pub fn put_randomness(&self, blocks: &Vec<(u64, Vec<u8>)>) -> Result<(), DbError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = SchemaBatch::new();
+
+        for block in blocks {
+            batch.put::<schema::randomness::RandomnessSchema>(&block.0, &block.1)?;
+        }
+
+        self.commit(batch)
+    }
+
+    /// Get randomness data for a specific block number
+    pub fn get_randomness(&self, block_number: u64) -> Result<Option<Vec<u8>>, DbError> {
+        Ok(self.get::<schema::randomness::RandomnessSchema>(&block_number)?)
+    }
+
+    /// Unwind the consensus DB to the given target block number.
+    /// All data for blocks with block_number > target_block_number will be deleted.
+    /// This includes: blocks, QCs, block numbers, ledger info, epoch-by-block-number,
+    /// randomness, last vote, and highest 2-chain timeout certificate.
+    pub fn unwind_to_block(
+        &self,
+        target_block_number: u64,
+    ) -> Result<(Vec<crate::quorum_store::types::BatchKey>, Vec<u64>), DbError> {
+        info!("ConsensusDB::unwind_to_block: unwinding to block {}", target_block_number);
+
+        let mut batch = SchemaBatch::new();
+        let mut deleted_blocks = 0u64;
+        let mut batches_to_delete = Vec::new();
+
+        // Step 1: Delete (epoch, block_id)-keyed CFs (Block, QC, BlockNumber).
+        // Iterate epochs from max_epoch downward. Within each epoch, scan BlockNumberSchema
+        // to find entries with block_number > target. Stop when an entire epoch has
+        // all block_numbers <= target (no more to delete in earlier epochs).
+        let max_epoch = self.get_max_epoch();
+        for epoch in (1..=max_epoch).rev() {
+            let start_key = (epoch, HashValue::zero());
+            let end_key = (epoch, HashValue::new([u8::MAX; HashValue::LENGTH]));
+
+            let blocks = self.get_range::<BlockSchema>(&start_key, &end_key)?;
+            if blocks.is_empty() {
+                // Empty epoch, continue to check earlier epochs
+                continue;
+            }
+
+            let mut all_blocks_kept = true;
+
+            for ((ep, block_id), block) in &blocks {
+                let mut bn = block.block_number();
+                if bn.is_none() {
+                    bn = self.get::<BlockNumberSchema>(&(*ep, *block_id))?;
+                }
+
+                let keep = match bn {
+                    Some(num) => num <= target_block_number + 1,
+                    None => false, // blocks without a block number must be deleted
+                };
+
+                if !keep {
+                    all_blocks_kept = false;
+
+                    if let Some(payload) = block.payload() {
+                        use aptos_consensus_types::common::Payload;
+                        match payload {
+                            Payload::InQuorumStore(proof_with_data) => {
+                                for proof in &proof_with_data.proofs {
+                                    batches_to_delete.push(
+                                        crate::quorum_store::types::BatchKey::new(
+                                            proof.info().epoch(),
+                                            *proof.info().digest(),
+                                        ),
+                                    );
+                                }
+                            }
+                            Payload::InQuorumStoreWithLimit(proof_with_limit) => {
+                                for proof in &proof_with_limit.proof_with_data.proofs {
+                                    batches_to_delete.push(
+                                        crate::quorum_store::types::BatchKey::new(
+                                            proof.info().epoch(),
+                                            *proof.info().digest(),
+                                        ),
+                                    );
+                                }
+                            }
+                            Payload::QuorumStoreInlineHybrid(
+                                inline_batches,
+                                proof_with_data,
+                                _,
+                            ) => {
+                                for (batch_info, _) in inline_batches {
+                                    batches_to_delete.push(
+                                        crate::quorum_store::types::BatchKey::new(
+                                            batch_info.epoch(),
+                                            *batch_info.digest(),
+                                        ),
+                                    );
+                                }
+                                for proof in &proof_with_data.proofs {
+                                    batches_to_delete.push(
+                                        crate::quorum_store::types::BatchKey::new(
+                                            proof.info().epoch(),
+                                            *proof.info().digest(),
+                                        ),
+                                    );
+                                }
+                            }
+                            Payload::OptQuorumStore(opt_qs_payload) => {
+                                for batch_info in &opt_qs_payload.opt_batches().batch_summary {
+                                    batches_to_delete.push(
+                                        crate::quorum_store::types::BatchKey::new(
+                                            batch_info.epoch(),
+                                            *batch_info.digest(),
+                                        ),
+                                    );
+                                }
+                                for proof in &opt_qs_payload.proof_with_data().batch_summary {
+                                    batches_to_delete.push(
+                                        crate::quorum_store::types::BatchKey::new(
+                                            proof.info().epoch(),
+                                            *proof.info().digest(),
+                                        ),
+                                    );
+                                }
+                            }
+                            Payload::DirectMempool(_) => {}
+                        }
+                    }
+
+                    batch.delete::<BlockSchema>(&(*ep, *block_id))?;
+                    batch.delete::<QCSchema>(&(*ep, *block_id))?;
+                    batch.delete::<BlockNumberSchema>(&(*ep, *block_id))?;
+                    deleted_blocks += 1;
+                }
+            }
+
+            if all_blocks_kept {
+                // All blocks in this epoch are <= target, no need to check earlier epochs.
+                break;
+            }
+        }
+
+        // Step 2: Delete block_number-keyed CFs by range query (target+1, u64::MAX).
+        let range_start = target_block_number.saturating_add(1);
+
+        // LedgerInfoSchema
+        let ledger_entries = self.get_range::<LedgerInfoSchema>(&range_start, &u64::MAX)?;
+        for (bn, _) in &ledger_entries {
+            batch.delete::<LedgerInfoSchema>(bn)?;
+        }
+
+        // EpochByBlockNumberSchema
+        let epoch_entries = self.get_range::<EpochByBlockNumberSchema>(&range_start, &u64::MAX)?;
+        for (bn, _) in &epoch_entries {
+            batch.delete::<EpochByBlockNumberSchema>(bn)?;
+        }
+
+        // RandomnessSchema
+        let randomness_entries =
+            self.get_range::<schema::randomness::RandomnessSchema>(&range_start, &u64::MAX)?;
+        for (bn, _) in &randomness_entries {
+            batch.delete::<schema::randomness::RandomnessSchema>(bn)?;
+        }
+
+        // Step 3: Clear stale vote and timeout certificate.
+        batch.delete::<schema::single_entry::SingleEntrySchema>(
+            &schema::single_entry::SingleEntryKey::LastVote,
+        )?;
+        batch.delete::<schema::single_entry::SingleEntrySchema>(
+            &schema::single_entry::SingleEntryKey::Highest2ChainTimeoutCert,
+        )?;
+
+        // Step 4: Commit all deletions atomically.
+        self.commit(batch)?;
+
+        let mut cancelled_epochs = Vec::new();
+        let max_retained_epoch = self.get_max_epoch();
+        if max_epoch > max_retained_epoch {
+            for ep in (max_retained_epoch + 1)..=max_epoch {
+                cancelled_epochs.push(ep);
+            }
+        }
+
+        // Step 5: Update the in-memory latest_ledger_info cache.
+        self.ledger_db.metadata_db().update_latest_ledger_info().map_err(|e| {
+            DbError::from(anyhow::anyhow!("Failed to update latest ledger info: {}", e))
+        })?;
+
+        info!(
+            "ConsensusDB::unwind_to_block complete: deleted {} blocks, \
+             {} ledger_infos, {} epoch_entries, {} randomness entries. Target: {}",
+            deleted_blocks,
+            ledger_entries.len(),
+            epoch_entries.len(),
+            randomness_entries.len(),
+            target_block_number
+        );
+
+        Ok((batches_to_delete, cancelled_epochs))
+    }
+}
+
+include!("include/reader.rs");
+include!("include/writer.rs");
+
+#[cfg(test)]
+mod test {
+    use laptos::aptos_crypto::{
+        bls12381,
+        ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
+        test_utils::KeyPair,
+        x25519, PrivateKey,
+    };
+
+    #[test]
+    fn gen_account_private_key() {
+        let current_dir = env!("CARGO_MANIFEST_DIR").to_string() + "/../../deploy_utils/";
+        let path = current_dir.clone() + "four_nodes_config.json";
+        let node_config_set = load_file(Path::new(&path));
+        node_config_set.iter().for_each(|(addr, config)| {
+            let mut rng = thread_rng();
+            let kp = KeyPair::<Ed25519PrivateKey, Ed25519PublicKey>::generate(&mut rng);
+            println!(
+                "{} private key {}, public key {}",
+                addr,
+                hex::encode(kp.private_key.to_bytes().as_slice()).as_str(),
+                kp.public_key.to_string()
+            )
+        });
+    }
+
+    use laptos::aptos_crypto::{Uniform, ValidCryptoMaterial};
+    use rand::thread_rng;
+    use std::path::Path;
+
+    use super::load_file;
+
+    #[test]
+    fn println_consensus_pri_key() {
+        for _ in 0..2 {
+            let mut rng = thread_rng();
+            let private_key = bls12381::PrivateKey::generate(&mut rng);
+            println!(
+                "consensus private key {:?}, public key {}",
+                private_key.to_bytes(),
+                private_key.public_key().to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn println_network_pri_key() {
+        for _ in 0..2 {
+            let mut rng = thread_rng();
+            let private_key = x25519::PrivateKey::generate(&mut rng);
+            println!(
+                "network private key {:?}, public key {}",
+                private_key.to_bytes(),
+                private_key.public_key().to_string()
+            );
+        }
+    }
+}

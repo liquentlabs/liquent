@@ -1,0 +1,8 @@
+config/
+.env
+*.tar
+*.tar.gz
+
+# Pre-built host binary staged for Dockerfile.host-binary (large; built by
+# `cargo build --bin liquent_node --profile quick-release` on the host).
+bin/

@@ -1,0 +1,483 @@
+use alloy_eips::BlockHashOrNumber;
+use api::{
+    check_bootstrap_config,
+    config_storage::ConfigStorageWrapper,
+    consensus_api::{ConsensusEngine, ConsensusEngineArgs},
+};
+use consensus::mock_consensus::mock::MockConsensus;
+use laptos::{
+    api_types::{
+        on_chain_config::consensus_hardfork::{
+            init_consensus_hardforks, ConsensusHardfork, ConsensusHardforks, ForkCondition,
+        },
+        relayer::GLOBAL_RELAYER,
+    },
+    aptos_config::config::RoleType,
+};
+use liquent_storage::block_view_storage::BlockViewStorage;
+use lreth::{
+    liquent_storage, reth,
+    reth_chainspec::ChainSpecProvider,
+    reth_cli::chainspec::ChainSpecParser,
+    reth_cli_util, reth_db, reth_node_api, reth_node_builder, reth_node_core, reth_node_ethereum,
+    reth_pipe_exec_layer_ext_v2::{self, ExecutionArgs},
+    reth_provider,
+};
+use pprof::{protos::Message, ProfilerGuard};
+use reth::rpc::builder::auth::AuthServerHandle;
+use reth_cli::{
+    RethBlockChainProvider, RethCliConfigStorage, RethEthCall, RethPipeExecLayerApi,
+    RethTransactionPool,
+};
+use reth_coordinator::RethCoordinator;
+use reth_db::DatabaseEnv;
+use reth_node_builder::{NodeBuilder, WithLaunchContext};
+use reth_provider::{BlockHashReader, BlockNumReader, BlockReader};
+use tokio::{
+    signal::unix::{signal, SignalKind},
+    sync::{broadcast, oneshot},
+};
+use tracing::{info, warn};
+mod broadcast_listener;
+mod chainspec;
+mod cli;
+mod consensus;
+mod mempool;
+mod node_metrics;
+pub mod relayer;
+mod reth_cli;
+mod reth_coordinator;
+use crate::{
+    chainspec::LiquentChainSpecParser, cli::Cli, mempool::Mempool, relayer::RelayerWrapper,
+};
+use std::{
+    fs::File,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+
+use crate::reth_cli::RethCli;
+use clap::Parser;
+use reth_node_builder::EngineNodeLauncher;
+use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
+use reth_provider::providers::BlockchainProvider;
+
+struct ConsensusArgs<EthApi: RethEthCall> {
+    pub engine_api: AuthServerHandle,
+    pub pipeline_api: RethPipeExecLayerApi<EthApi>,
+    pub provider: RethBlockChainProvider,
+    pub pool: RethTransactionPool,
+}
+
+// ConsensusAlpha is activated by the genesis `alphaTime` field (seconds,
+// registered as a microsecond Timestamp). It is the only genesis field the
+// CL reads for Alpha (liquentlabs/liquent-audit#925).
+fn consensus_hardforks_from_genesis_extra_fields(
+    get_extra_field: impl Fn(&str) -> Option<u64>,
+) -> ConsensusHardforks {
+    let mut hardforks = ConsensusHardforks::new();
+
+    if let Some(alpha_time_secs) = get_extra_field("alphaTime") {
+        hardforks.insert(
+            ConsensusHardfork::ConsensusAlpha,
+            ForkCondition::Timestamp(alpha_time_secs.saturating_mul(1_000_000)),
+        );
+    }
+
+    hardforks
+}
+
+fn run_reth(
+    cli: Cli<LiquentChainSpecParser>,
+    execution_args_rx: oneshot::Receiver<ExecutionArgs>,
+    mut shutdown: broadcast::Receiver<()>,
+) -> (ConsensusArgs<impl RethEthCall>, u64, oneshot::Receiver<PathBuf>, thread::JoinHandle<()>) {
+    let (datadir_tx, datadir_rx) = oneshot::channel::<PathBuf>();
+    reth_cli_util::sigsegv_handler::install();
+
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+    let reth_thread = std::thread::spawn(move || {
+        // Trick code to ensure the `rx.recv` won't panic before the error message is printed
+        let _tx = tx.clone();
+        let res = cli.run(
+            |builder: WithLaunchContext<
+                NodeBuilder<
+                    Arc<DatabaseEnv>,
+                    <LiquentChainSpecParser as ChainSpecParser>::ChainSpec,
+                >,
+            >,
+             _| {
+                async move {
+                    let handle = builder
+                        .with_types_and_provider::<EthereumNode, BlockchainProvider<_>>()
+                        .with_components(EthereumNode::components())
+                        .with_add_ons(EthereumAddOns::default())
+                        .launch_with_fn(|builder| {
+                            let datadir = builder.config().datadir();
+                            // Send datadir via oneshot channel
+                            let _ = datadir_tx.send(datadir.data_dir().to_path_buf());
+                            let launcher = EngineNodeLauncher::new(
+                                builder.task_executor().clone(),
+                                datadir,
+                                reth_node_api::TreeConfig::default(),
+                            );
+                            builder.launch_with(launcher)
+                        })
+                        .await?;
+                    let chain_spec = handle.node.chain_spec();
+
+                    // Initialize consensus-layer hardforks from genesis.json extra_fields.
+                    {
+                        let extra = &chain_spec.genesis.config.extra_fields;
+                        let hardforks = consensus_hardforks_from_genesis_extra_fields(|key| {
+                            extra.get(key).and_then(|v| v.as_u64())
+                        });
+                        info!("Consensus hardforks:\n{}", hardforks);
+                        init_consensus_hardforks(hardforks);
+                    }
+
+                    let eth_api = handle.node.rpc_registry.eth_api().clone();
+                    let engine_cli = handle.node.auth_server_handle().clone();
+                    let provider = handle.node.provider;
+                    let recover_block_number = provider
+                        .recover_block_number()
+                        .expect("Failed to recover block number from DB");
+                    info!("The latest_block_number is {}", recover_block_number);
+                    let latest_block_hash = provider
+                        .block_hash(recover_block_number)
+                        .expect("Failed to read block hash from DB")
+                        .unwrap_or_else(|| {
+                            panic!("Block hash not found for block number {recover_block_number}")
+                        });
+                    let latest_block = provider
+                        .block(BlockHashOrNumber::Number(recover_block_number))
+                        .expect("Failed to read block from DB")
+                        .unwrap_or_else(|| {
+                            panic!("Block not found for block number {recover_block_number}")
+                        });
+                    let pool = handle.node.pool;
+
+                    let storage = BlockViewStorage::new(provider.clone());
+                    let pipeline_api_v2 = reth_pipe_exec_layer_ext_v2::new_pipe_exec_layer_api(
+                        chain_spec,
+                        storage,
+                        latest_block.header,
+                        latest_block_hash,
+                        execution_args_rx,
+                        eth_api,
+                    );
+                    let args = ConsensusArgs {
+                        engine_api: engine_cli,
+                        pipeline_api: pipeline_api_v2,
+                        provider,
+                        pool,
+                    };
+                    let _ = tx.send((args, recover_block_number));
+
+                    tokio::select! {
+                        _ = handle.node_exit_future => {},
+                        _ = shutdown.recv() => {
+                            info!("Reth node shutdown signal received");
+                        }
+                    }
+
+                    Ok(())
+                }
+            },
+        );
+        if let Err(err) = res {
+            eprintln!("Error: {err:?}");
+            std::process::exit(1);
+        }
+    });
+
+    let (args, block_number) = rx.recv().unwrap();
+    (args, block_number, datadir_rx, reth_thread)
+}
+
+struct ProfilingState {
+    guard: Option<ProfilerGuard<'static>>,
+    profile_count: usize,
+}
+
+fn setup_pprof_profiler() -> Arc<Mutex<ProfilingState>> {
+    let profiling_state = Arc::new(Mutex::new(ProfilingState { guard: None, profile_count: 0 }));
+
+    let profiling_state_clone = profiling_state.clone();
+
+    thread::spawn(move || {
+        let config = 99;
+
+        let start = Instant::now();
+        let max_duration = Duration::from_secs(60 * 30);
+
+        while start.elapsed() < max_duration {
+            let profile_duration = Duration::from_secs(3 * 60);
+
+            {
+                let mut state = profiling_state_clone.lock().unwrap();
+                state.guard = Some(ProfilerGuard::new(config).unwrap());
+                println!("Started profiling session #{}", state.profile_count + 1);
+            }
+
+            thread::sleep(profile_duration);
+            {
+                let mut state = profiling_state_clone.lock().unwrap();
+                if let Some(guard) = state.guard.take() {
+                    if let Ok(report) = guard.report().build() {
+                        let count = state.profile_count;
+
+                        let now = std::time::SystemTime::now();
+                        let formatted_time = {
+                            let elapsed = now.duration_since(std::time::UNIX_EPOCH).unwrap();
+                            let secs = elapsed.as_secs();
+                            let time =
+                                time::OffsetDateTime::from_unix_timestamp(secs as i64).unwrap();
+                            format!("{:02}", time.millisecond())
+                        };
+
+                        let proto_path = format!("profile_{count}_proto_{formatted_time:?}.pb");
+                        if let Ok(mut file) = File::create(&proto_path) {
+                            if let Ok(profile) = report.pprof() {
+                                let mut content = Vec::new();
+                                if profile.write_to_vec(&mut content).is_ok() &&
+                                    std::io::Write::write_all(&mut file, &content).is_ok()
+                                {
+                                    println!("Wrote protobuf to {proto_path}");
+                                }
+                            }
+                        }
+                        state.profile_count += 1;
+                    }
+                }
+            }
+
+            thread::sleep(Duration::from_secs(5));
+        }
+    });
+    profiling_state
+}
+
+fn main() {
+    // Set RUST_BACKTRACE before any threads are spawned to avoid UB from std::env::set_var
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::env::set_var("RUST_BACKTRACE", "1");
+    }
+
+    // Raise new-tx body listener buffer before CLI parse (operators can still
+    // override via --txpool.max-new-txns). Default lreth size is 1024.
+    if reth_node_core::args::DefaultTxPoolValues::default()
+        .with_new_tx_listener_buffer_size(1024 * 16)
+        .try_init()
+        .is_err()
+    {
+        warn!("DefaultTxPoolValues already initialized; leaving new_tx_listener_buffer_size as-is");
+    }
+
+    let _profiling_state =
+        if std::env::var("ENABLE_PPROF").is_ok() { Some(setup_pprof_profiler()) } else { None };
+    let cli = Cli::parse();
+
+    // For utility subcommands (stage, db, init, config, etc.), skip full node initialization
+    // and just run the CLI command directly.
+    if !cli.is_node_command() {
+        reth_cli_util::sigsegv_handler::install();
+        let res = cli.run(
+            |_builder: WithLaunchContext<
+                NodeBuilder<
+                    Arc<DatabaseEnv>,
+                    <LiquentChainSpecParser as ChainSpecParser>::ChainSpec,
+                >,
+            >,
+             _| {
+                async move { unreachable!("launcher should not be called for utility commands") }
+            },
+        );
+        if let Err(err) = res {
+            eprintln!("Error: {err:?}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Full node path: requires config, consensus, relayer, etc.
+    node_metrics::register_binary_info_metrics();
+    let relayer_config_path = cli.liquent_node_config.relayer_config_path.clone();
+    let gcei_config = check_bootstrap_config(cli.liquent_node_config.node_config_path.clone());
+
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+    let shutdown_tx_clone = shutdown_tx.clone();
+
+    // Spawn Ctrl+C handler
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl+C, initiating shutdown...");
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, initiating shutdown...");
+                }
+            }
+            let _ = shutdown_tx_clone.send(());
+        });
+    });
+
+    let (execution_args_tx, execution_args_rx) = oneshot::channel();
+    let (consensus_args, latest_block_number, datadir_rx, reth_thread) =
+        run_reth(cli, execution_args_rx, shutdown_tx.subscribe());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let chain_id = {
+        let chain_info = consensus_args.provider.chain_spec().chain;
+        match chain_info.into_kind() {
+            lreth::reth_chainspec::ChainKind::Named(n) => n as u64,
+            lreth::reth_chainspec::ChainKind::Id(id) => id,
+        }
+    };
+    // Clone reth pool for the body listener before Mempool / RethCli consume it.
+    let reth_pool = consensus_args.pool.clone();
+    let mempool =
+        Mempool::new(reth_pool.clone(), gcei_config.base.role == RoleType::FullNode, chain_id);
+    // Post blackhole gate — must match get_broadcast_txns emptiness.
+    let enable_broadcast = mempool.enable_broadcast();
+    let pool = Box::new(mempool);
+    let txn_cache = pool.tx_cache();
+    let shutdown_rx_cli = shutdown_tx.subscribe();
+    // `_engine` owns tokio Runtimes; it must be returned out of `block_on` so it
+    // drops in this sync context — dropping a Runtime inside an async context
+    // panics in tokio's blocking-pool shutdown.
+    let (coordinator_result, _engine, failed_init_coordinator) = rt.block_on(async move {
+        let datadir = datadir_rx.await.expect("datadir should be sent");
+        let client = Arc::new(RethCli::new(consensus_args, txn_cache, shutdown_rx_cli).await);
+        let chain_id = client.chain_id();
+
+        let coordinator = Arc::new(RethCoordinator::new(
+            client.clone(),
+            latest_block_number,
+            execution_args_tx,
+            shutdown_tx.clone(),
+        ));
+        let mut _engine = None;
+        if std::env::var("MOCK_CONSENSUS").unwrap_or("false".to_string()).parse::<bool>().unwrap() {
+            warn!("MOCK_CONSENSUS is enabled! This disables BFT consensus and should NEVER be used in production.");
+            info!("start mock consensus");
+            let mock = MockConsensus::new(pool).await;
+            tokio::spawn(async move {
+                mock.run().await;
+            });
+        } else {
+            let relayer = Arc::new(RelayerWrapper::new(relayer_config_path, datadir));
+            match GLOBAL_RELAYER.set(relayer) {
+                Ok(_) => {}
+                Err(_) => {
+                    panic!("failed to set global relayer");
+                }
+            }
+            match ConsensusEngine::init(
+                ConsensusEngineArgs {
+                    node_config: gcei_config,
+                    chain_id,
+                    latest_block_number,
+                    config_storage: Some(Arc::new(ConfigStorageWrapper::new(Arc::new(
+                        RethCliConfigStorage::new(client),
+                    )))),
+                },
+                pool,
+            )
+            .await
+            {
+                Ok((engine, admit_handle)) => {
+                    if enable_broadcast {
+                        // CAP/wait from env (MEMPOOL_ADMIT_BATCH_*); see AdmitBatchConfig::from_env.
+                        broadcast_listener::spawn_broadcast_listener(
+                            reth_pool,
+                            admit_handle,
+                            chain_id,
+                            broadcast_listener::AdmitBatchConfig::from_env(),
+                        );
+                    }
+                    // Otherwise drop admit_handle; validators do not subscribe.
+                    _engine = Some(engine);
+                }
+                Err(error) => {
+                    tracing::error!("Failed to initialize consensus engine: {error:#}");
+                    let _ = shutdown_tx.send(());
+                    return (
+                        Err(format!("failed to initialize consensus engine: {error:#}")),
+                        _engine,
+                        Some(coordinator),
+                    );
+                }
+            }
+        }
+        coordinator.send_execution_args().await;
+        let result = coordinator.run().await;
+        if let Err(err) = &result {
+            tracing::error!("Reth coordinator stopped with error: {err}");
+            let _ = shutdown_tx.send(());
+        }
+
+        info!("Main shutdown complete");
+        (result, _engine, None)
+    });
+    drop(rt);
+    drop(_engine);
+
+    // Keep the execution-args sender alive until Reth has shut down. Its receiver
+    // currently unwraps channel closure, so dropping the failed coordinator first
+    // would turn an expected initialization error into a background-task panic.
+    let reth_result = reth_thread.join();
+    drop(failed_init_coordinator);
+    if let Err(err) = reth_result {
+        eprintln!("Reth thread panicked: {err:?}");
+        std::process::exit(1);
+    }
+
+    if let Err(err) = coordinator_result {
+        eprintln!("Reth coordinator stopped with error: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the audit fix (liquentlabs/liquent-audit#925): the CL builds Alpha's
+    /// activation solely from `alphaTime`. The closure below supplies a value
+    /// for every field EXCEPT `alphaTime`, so if the CL ever read any other
+    /// genesis field, Alpha would register a condition and this test would go
+    /// red.
+    #[test]
+    fn only_alpha_time_activates_consensus_alpha() {
+        let hardforks =
+            consensus_hardforks_from_genesis_extra_fields(|key| (key != "alphaTime").then_some(0));
+
+        assert_eq!(
+            hardforks.condition(ConsensusHardfork::ConsensusAlpha),
+            ForkCondition::Never,
+            "no genesis field other than alphaTime may activate Alpha",
+        );
+        assert!(!hardforks.is_active_at_epoch(ConsensusHardfork::ConsensusAlpha, 0));
+    }
+
+    /// `alphaTime` (seconds) is read as a microsecond timestamp condition.
+    #[test]
+    fn alpha_time_registers_timestamp_condition() {
+        let hardforks = consensus_hardforks_from_genesis_extra_fields(|key| match key {
+            "alphaTime" => Some(crate::chainspec::LIQUENT_MAINNET_ALPHA_TIME),
+            _ => None,
+        });
+
+        assert_eq!(
+            hardforks.condition(ConsensusHardfork::ConsensusAlpha),
+            ForkCondition::Timestamp(1_785_128_400_000_000),
+        );
+    }
+}

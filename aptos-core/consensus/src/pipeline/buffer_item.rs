@@ -1,0 +1,642 @@
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::{pipeline::hashable::Hashable, state_replication::StateComputerCommitCallBackType};
+use anyhow::anyhow;
+use aptos_consensus_types::{
+    common::Author, pipeline::commit_vote::CommitVote, pipelined_block::PipelinedBlock,
+};
+use aptos_executor_types::ExecutorResult;
+use futures::future::BoxFuture;
+use laptos::{
+    api_types::on_chain_config::consensus_hardfork::{is_consensus_fork_active, ConsensusHardfork},
+    aptos_crypto::{bls12381, HashValue},
+    aptos_logger::prelude::*,
+    aptos_reliable_broadcast::DropGuard,
+    aptos_types::{
+        aggregate_signature::PartialSignatures,
+        block_info::BlockInfo,
+        ledger_info::{LedgerInfo, LedgerInfoWithSignatures, LedgerInfoWithVerifiedSignatures},
+        validator_verifier::ValidatorVerifier,
+    },
+};
+use itertools::zip_eq;
+use tokio::time::Instant;
+
+fn log_execution_state_for_mismatch(
+    label: &str,
+    executed_blocks: &[PipelinedBlock],
+    local: &BlockInfo,
+    incoming: &BlockInfo,
+) {
+    error!(
+        label = label,
+        local_commit_info = %local,
+        incoming_commit_info = %incoming,
+        num_executed_blocks = executed_blocks.len(),
+        "commit_info mismatch detected before panic; dumping SDK StateComputeResult summary",
+    );
+
+    for block in executed_blocks {
+        let result = block.compute_result();
+        let txn_status = result.txn_status();
+        error!(
+            label = label,
+            block_id = %block.id(),
+            parent_id = %block.parent_id(),
+            epoch = block.epoch(),
+            round = block.round(),
+            block_number = ?block.block().block_number(),
+            executed_state_id = ?result.root_hash(),
+            has_reconfiguration = result.has_reconfiguration(),
+            next_epoch = result.epoch_state().as_ref().map(|e| e.epoch),
+            txn_status_len = txn_status.as_ref().as_ref().map(|statuses| statuses.len()),
+            event_count = result.execution_output.events.len(),
+            "commit_info mismatch executed block state",
+        );
+    }
+}
+
+fn generate_commit_ledger_info(
+    commit_info: &BlockInfo,
+    ordered_proof: &LedgerInfoWithSignatures,
+    order_vote_enabled: bool,
+    block_hash: HashValue,
+    block_number: u64,
+) -> LedgerInfo {
+    let mut ledger_info = LedgerInfo::new_with_block_info(
+        commit_info.clone(),
+        if order_vote_enabled {
+            HashValue::zero()
+        } else {
+            ordered_proof.ledger_info().consensus_data_hash()
+        },
+        block_hash,
+        block_number,
+    );
+    ledger_info
+}
+
+fn verify_signatures(
+    unverified_signatures: PartialSignatures,
+    validator: &ValidatorVerifier,
+    commit_ledger_info: &LedgerInfo,
+) -> PartialSignatures {
+    // Returns a valid partial signature from a set of unverified signatures.
+    // TODO: Validating individual signatures in expensive. Replace this with optimistic signature
+    // verification for BLS. Here, we can implement a tree-based batch verification technique that
+    // filters out invalid signature shares much faster when there are only a few of them
+    // (e.g., [LM07]: Finding Invalid Signatures in Pairing-Based Batches,
+    // by Law, Laurie and Matt, Brian J., in Cryptography and Coding, 2007).
+    let raw_signature_count = unverified_signatures.signatures().len();
+    let mut failed_authors = vec![];
+    let verified_signatures = PartialSignatures::new(
+        unverified_signatures
+            .signatures()
+            .iter()
+            .filter_map(|(author, sig)| {
+                if validator.verify(*author, commit_ledger_info, sig).is_ok() {
+                    Some((*author, sig.clone()))
+                } else {
+                    failed_authors.push(*author);
+                    None
+                }
+            })
+            .collect(),
+    );
+    let verified_signature_count = verified_signatures.signatures().len();
+    if !failed_authors.is_empty() {
+        warn!(
+            commit_info = ?commit_ledger_info.commit_info(),
+            block_hash = ?commit_ledger_info.block_hash(),
+            block_number = commit_ledger_info.block_number(),
+            raw_signature_count = raw_signature_count,
+            verified_signature_count = verified_signature_count,
+            failed_authors = ?failed_authors,
+            "Commit vote signature verification filtered signatures",
+        );
+    } else {
+        debug!(
+            commit_info = ?commit_ledger_info.commit_info(),
+            block_hash = ?commit_ledger_info.block_hash(),
+            block_number = commit_ledger_info.block_number(),
+            raw_signature_count = raw_signature_count,
+            verified_signature_count = verified_signature_count,
+            "Commit vote signature verification completed",
+        );
+    }
+    verified_signatures
+}
+
+fn generate_executed_item_from_ordered(
+    commit_info: BlockInfo,
+    executed_blocks: Vec<PipelinedBlock>,
+    verified_signatures: PartialSignatures,
+    callback: StateComputerCommitCallBackType,
+    ordered_proof: LedgerInfoWithSignatures,
+    order_vote_enabled: bool,
+    use_corrected_commit_timestamp: bool,
+) -> BufferItem {
+    debug!("{} advance to executed from ordered", commit_info);
+    let block = executed_blocks.last().expect("execute_blocks should not be empty!");
+    let timestamp_usecs = executed_commit_timestamp_usecs(
+        commit_info.timestamp_usecs(),
+        block.timestamp_usecs(),
+        use_corrected_commit_timestamp,
+    );
+    let new_commit_info = BlockInfo::new_with_epoch_block_info(
+        commit_info.epoch(),
+        commit_info.round(),
+        commit_info.id(),
+        commit_info.executed_state_id(),
+        block.block().block_number().unwrap(),
+        timestamp_usecs,
+        commit_info.next_epoch_state().cloned(),
+        commit_info.epoch_block_info().cloned(),
+    );
+    let commit_ledger_info = generate_commit_ledger_info(
+        &new_commit_info,
+        &ordered_proof,
+        order_vote_enabled,
+        block.compute_result().root_hash(),
+        block.block().block_number().unwrap(),
+    );
+    let partial_commit_proof =
+        LedgerInfoWithVerifiedSignatures::new(commit_ledger_info, verified_signatures);
+    BufferItem::Executed(Box::new(ExecutedItem {
+        executed_blocks,
+        partial_commit_proof,
+        callback,
+        commit_info: new_commit_info,
+        ordered_proof,
+    }))
+}
+
+fn executed_commit_timestamp_usecs(
+    corrected_commit_timestamp_usecs: u64,
+    block_timestamp_usecs: u64,
+    use_corrected_commit_timestamp: bool,
+) -> u64 {
+    if use_corrected_commit_timestamp {
+        corrected_commit_timestamp_usecs
+    } else {
+        block_timestamp_usecs
+    }
+}
+
+fn aggregate_commit_proof(
+    commit_ledger_info: &LedgerInfo,
+    verified_signatures: &PartialSignatures,
+    validator: &ValidatorVerifier,
+) -> LedgerInfoWithSignatures {
+    let aggregated_sig = validator
+        .aggregate_signatures(verified_signatures.signatures_iter())
+        .expect("Failed to generate aggregated signature");
+    LedgerInfoWithSignatures::new(commit_ledger_info.clone(), aggregated_sig)
+}
+
+// we differentiate buffer items at different stages
+// for better code readability
+pub struct OrderedItem {
+    pub unverified_signatures: PartialSignatures,
+    // This can happen in the fast forward sync path, where we can receive the commit proof
+    // from peers.
+    pub commit_proof: Option<LedgerInfoWithSignatures>,
+    pub callback: StateComputerCommitCallBackType,
+    pub ordered_blocks: Vec<PipelinedBlock>,
+    pub ordered_proof: LedgerInfoWithSignatures,
+}
+
+pub struct ExecutedItem {
+    pub executed_blocks: Vec<PipelinedBlock>,
+    pub partial_commit_proof: LedgerInfoWithVerifiedSignatures,
+    pub callback: StateComputerCommitCallBackType,
+    pub commit_info: BlockInfo,
+    pub ordered_proof: LedgerInfoWithSignatures,
+}
+
+pub struct SignedItem {
+    pub executed_blocks: Vec<PipelinedBlock>,
+    pub partial_commit_proof: LedgerInfoWithVerifiedSignatures,
+    pub callback: StateComputerCommitCallBackType,
+    pub commit_vote: CommitVote,
+    pub rb_handle: Option<(Instant, DropGuard)>,
+}
+
+pub struct AggregatedItem {
+    pub executed_blocks: Vec<PipelinedBlock>,
+    pub commit_proof: LedgerInfoWithSignatures,
+    pub callback: StateComputerCommitCallBackType,
+}
+
+pub enum BufferItem {
+    Ordered(Box<OrderedItem>),
+    Executed(Box<ExecutedItem>),
+    Signed(Box<SignedItem>),
+    Aggregated(Box<AggregatedItem>),
+}
+
+impl Hashable for BufferItem {
+    fn hash(&self) -> HashValue {
+        self.block_id()
+    }
+}
+
+pub type ExecutionFut = BoxFuture<'static, ExecutorResult<Vec<PipelinedBlock>>>;
+
+impl BufferItem {
+    pub fn new_ordered(
+        ordered_blocks: Vec<PipelinedBlock>,
+        ordered_proof: LedgerInfoWithSignatures,
+        callback: StateComputerCommitCallBackType,
+    ) -> Self {
+        Self::Ordered(Box::new(OrderedItem {
+            unverified_signatures: PartialSignatures::empty(),
+            commit_proof: None,
+            callback,
+            ordered_blocks,
+            ordered_proof,
+        }))
+    }
+
+    // pipeline functions
+    pub fn advance_to_executed_or_aggregated(
+        self,
+        executed_blocks: Vec<PipelinedBlock>,
+        validator: &ValidatorVerifier,
+        epoch_end_timestamp: Option<u64>,
+        order_vote_enabled: bool,
+        epoch_block_info: Option<laptos::aptos_types::block_info::EpochBlockInfo>,
+    ) -> Self {
+        match self {
+            Self::Ordered(ordered_item) => {
+                let OrderedItem {
+                    ordered_blocks,
+                    commit_proof,
+                    unverified_signatures,
+                    callback,
+                    ordered_proof,
+                } = *ordered_item;
+                for (b1, b2) in zip_eq(ordered_blocks.iter(), executed_blocks.iter()) {
+                    assert_eq!(b1.id(), b2.id());
+                }
+                let block = executed_blocks.last().expect("execute_blocks should not be empty!");
+                let mut commit_info = block.block_info();
+                match epoch_end_timestamp {
+                    Some(timestamp) if commit_info.timestamp_usecs() != timestamp => {
+                        assert!(executed_blocks.last().expect("").is_reconfiguration_suffix());
+                        commit_info.change_timestamp(timestamp);
+                    }
+                    _ => (),
+                }
+                let commit_info = BlockInfo::new_with_epoch_block_info(
+                    commit_info.epoch(),
+                    commit_info.round(),
+                    commit_info.id(),
+                    commit_info.executed_state_id(),
+                    commit_info.version(),
+                    commit_info.timestamp_usecs(),
+                    commit_info.next_epoch_state().cloned(),
+                    epoch_block_info.or_else(|| commit_info.epoch_block_info().cloned()),
+                );
+                if let Some(commit_proof) = commit_proof {
+                    // We have already received the commit proof in fast forward sync path,
+                    // we can just use that proof and proceed to aggregated
+                    if *commit_proof.commit_info() != commit_info {
+                        log_execution_state_for_mismatch(
+                            "ordered_to_aggregated",
+                            &executed_blocks,
+                            &commit_info,
+                            commit_proof.commit_info(),
+                        );
+                    }
+                    assert_eq!(commit_proof.commit_info().clone(), commit_info);
+                    debug!("{} advance to aggregated from ordered", commit_proof.commit_info());
+                    Self::Aggregated(Box::new(AggregatedItem {
+                        executed_blocks,
+                        commit_proof,
+                        callback,
+                    }))
+                } else {
+                    let commit_ledger_info = generate_commit_ledger_info(
+                        &commit_info,
+                        &ordered_proof,
+                        order_vote_enabled,
+                        block.compute_result().root_hash(),
+                        block.block().block_number().unwrap(),
+                    );
+                    let verified_signatures =
+                        verify_signatures(unverified_signatures, validator, &commit_ledger_info);
+                    let voting_power_result =
+                        validator.check_voting_power(verified_signatures.signatures().keys(), true);
+                    if voting_power_result.is_ok() {
+                        let commit_proof = aggregate_commit_proof(
+                            &commit_ledger_info,
+                            &verified_signatures,
+                            validator,
+                        );
+                        debug!("{} advance to aggregated from ordered", commit_proof.commit_info());
+                        Self::Aggregated(Box::new(AggregatedItem {
+                            executed_blocks,
+                            commit_proof,
+                            callback,
+                        }))
+                    } else {
+                        debug!(
+                            commit_info = ?commit_ledger_info.commit_info(),
+                            block_hash = ?commit_ledger_info.block_hash(),
+                            block_number = commit_ledger_info.block_number(),
+                            verified_signature_count = verified_signatures.signatures().len(),
+                            error = ?voting_power_result.err(),
+                            "Commit vote signatures do not have enough voting power after execution",
+                        );
+                        let use_corrected_commit_timestamp = is_consensus_fork_active(
+                            ConsensusHardfork::ConsensusAlpha,
+                            block.timestamp_usecs(),
+                        );
+                        generate_executed_item_from_ordered(
+                            commit_info,
+                            executed_blocks,
+                            verified_signatures,
+                            callback,
+                            ordered_proof,
+                            order_vote_enabled,
+                            use_corrected_commit_timestamp,
+                        )
+                    }
+                }
+            }
+            _ => {
+                panic!("Only ordered blocks can advance to executed blocks.")
+            }
+        }
+    }
+
+    pub fn advance_to_signed(self, author: Author, signature: bls12381::Signature) -> Self {
+        match self {
+            Self::Executed(executed_item) => {
+                let ExecutedItem { executed_blocks, callback, partial_commit_proof, .. } =
+                    *executed_item;
+
+                // we don't add the signature here, it'll be added when receiving the commit vote
+                // from self
+                let commit_vote = CommitVote::new_with_signature(
+                    author,
+                    partial_commit_proof.ledger_info().clone(),
+                    signature,
+                );
+                debug!("{} advance to signed", partial_commit_proof.commit_info());
+
+                Self::Signed(Box::new(SignedItem {
+                    executed_blocks,
+                    callback,
+                    partial_commit_proof,
+                    commit_vote,
+                    rb_handle: None,
+                }))
+            }
+            _ => {
+                panic!("Only executed buffer items can advance to signed blocks.")
+            }
+        }
+    }
+
+    /// this function assumes block id matches and the validity of ledger_info and that it has the
+    /// voting power it returns an updated item
+    pub fn try_advance_to_aggregated_with_ledger_info(
+        self,
+        commit_proof: LedgerInfoWithSignatures,
+    ) -> Self {
+        match self {
+            Self::Signed(signed_item) => {
+                let SignedItem {
+                    executed_blocks,
+                    callback,
+                    partial_commit_proof: local_commit_proof,
+                    ..
+                } = *signed_item;
+                if local_commit_proof.commit_info() != commit_proof.commit_info() {
+                    log_execution_state_for_mismatch(
+                        "signed_to_aggregated",
+                        &executed_blocks,
+                        local_commit_proof.commit_info(),
+                        commit_proof.commit_info(),
+                    );
+                }
+                assert_eq!(local_commit_proof.commit_info(), commit_proof.commit_info(),);
+                debug!("{} advance to aggregated with commit decision", commit_proof.commit_info());
+                Self::Aggregated(Box::new(AggregatedItem {
+                    executed_blocks,
+                    callback,
+                    commit_proof,
+                }))
+            }
+            Self::Executed(executed_item) => {
+                let ExecutedItem { executed_blocks, callback, commit_info, .. } = *executed_item;
+                if commit_info != *commit_proof.commit_info() {
+                    log_execution_state_for_mismatch(
+                        "executed_to_aggregated",
+                        &executed_blocks,
+                        &commit_info,
+                        commit_proof.commit_info(),
+                    );
+                }
+                assert_eq!(commit_info, *commit_proof.commit_info());
+                debug!("{} advance to aggregated with commit decision", commit_proof.commit_info());
+                let block = executed_blocks.last().unwrap();
+                Self::Aggregated(Box::new(AggregatedItem {
+                    executed_blocks,
+                    callback,
+                    commit_proof,
+                }))
+            }
+            Self::Ordered(ordered_item) => {
+                let ordered = *ordered_item;
+                assert!(ordered
+                    .ordered_proof
+                    .commit_info()
+                    .match_ordered_only(commit_proof.commit_info()));
+                // can't aggregate it without execution, only store the signatures
+                debug!("{} received commit decision in ordered stage", commit_proof.commit_info());
+                Self::Ordered(Box::new(OrderedItem { commit_proof: Some(commit_proof), ..ordered }))
+            }
+            Self::Aggregated(_) => {
+                unreachable!("Found aggregated buffer item but any aggregated buffer item should get dequeued right away.");
+            }
+        }
+    }
+
+    pub fn try_advance_to_aggregated(self, validator: &ValidatorVerifier) -> Self {
+        match self {
+            Self::Signed(signed_item) => {
+                let voting_power_result = validator
+                    .check_voting_power(signed_item.partial_commit_proof.signatures().keys(), true);
+                if voting_power_result.is_ok() {
+                    let commit_proof = aggregate_commit_proof(
+                        signed_item.partial_commit_proof.ledger_info(),
+                        signed_item.partial_commit_proof.partial_sigs(),
+                        validator,
+                    );
+                    let block = signed_item.executed_blocks.last().unwrap();
+                    Self::Aggregated(Box::new(AggregatedItem {
+                        executed_blocks: signed_item.executed_blocks,
+                        commit_proof,
+                        callback: signed_item.callback,
+                    }))
+                } else {
+                    warn!(
+                        commit_info = ?signed_item.partial_commit_proof.commit_info(),
+                        block_hash = ?signed_item.partial_commit_proof.ledger_info().block_hash(),
+                        block_number = signed_item.partial_commit_proof.ledger_info().block_number(),
+                        signature_count = signed_item.partial_commit_proof.signatures().len(),
+                        error = ?voting_power_result.err(),
+                        "Signed buffer item does not have enough commit voting power",
+                    );
+                    Self::Signed(signed_item)
+                }
+            }
+            Self::Executed(executed_item) => {
+                let voting_power_result = validator.check_voting_power(
+                    executed_item.partial_commit_proof.signatures().keys(),
+                    true,
+                );
+                if voting_power_result.is_ok() {
+                    Self::Aggregated(Box::new(AggregatedItem {
+                        executed_blocks: executed_item.executed_blocks,
+                        commit_proof: aggregate_commit_proof(
+                            executed_item.partial_commit_proof.ledger_info(),
+                            executed_item.partial_commit_proof.partial_sigs(),
+                            validator,
+                        ),
+                        callback: executed_item.callback,
+                    }))
+                } else {
+                    warn!(
+                        commit_info = ?executed_item.partial_commit_proof.commit_info(),
+                        block_hash = ?executed_item.partial_commit_proof.ledger_info().block_hash(),
+                        block_number = executed_item.partial_commit_proof.ledger_info().block_number(),
+                        signature_count = executed_item.partial_commit_proof.signatures().len(),
+                        error = ?voting_power_result.err(),
+                        "Executed buffer item does not have enough commit voting power",
+                    );
+                    Self::Executed(executed_item)
+                }
+            }
+            _ => self,
+        }
+    }
+
+    // generic functions
+    pub fn get_blocks(&self) -> &Vec<PipelinedBlock> {
+        match self {
+            Self::Ordered(ordered) => &ordered.ordered_blocks,
+            Self::Executed(executed) => &executed.executed_blocks,
+            Self::Signed(signed) => &signed.executed_blocks,
+            Self::Aggregated(aggregated) => &aggregated.executed_blocks,
+        }
+    }
+
+    pub fn block_id(&self) -> HashValue {
+        self.get_blocks().last().expect("Vec<PipelinedBlock> should not be empty").id()
+    }
+
+    pub fn commit_info(&self) -> &BlockInfo {
+        match self {
+            Self::Ordered(ordered) => ordered.ordered_proof.commit_info(),
+            Self::Executed(executed) => &executed.commit_info,
+            Self::Signed(signed) => signed.partial_commit_proof.commit_info(),
+            Self::Aggregated(aggregated) => &aggregated.commit_proof.commit_info(),
+        }
+    }
+
+    pub fn add_signature_if_matched(&mut self, vote: CommitVote) -> anyhow::Result<()> {
+        let target_commit_info = vote.commit_info();
+        let author = vote.author();
+        let signature = vote.signature().clone();
+        match self {
+            Self::Ordered(ordered) => {
+                if ordered.ordered_proof.commit_info().match_ordered_only(target_commit_info) {
+                    // we optimistically assume the vote will be valid in the future.
+                    // when advancing to executed item, we will check if the sigs are valid.
+                    // each author at most stores a single sig for each item,
+                    // so an adversary will not be able to flood our memory.
+                    ordered.unverified_signatures.add_signature(author, signature);
+                    return Ok(());
+                }
+            }
+            Self::Executed(executed) => {
+                if executed.commit_info == *target_commit_info {
+                    executed.partial_commit_proof.add_signature(author, signature);
+                    return Ok(());
+                }
+            }
+            Self::Signed(signed) => {
+                if signed.partial_commit_proof.commit_info() == target_commit_info {
+                    signed.partial_commit_proof.add_signature(author, signature);
+                    return Ok(());
+                }
+            }
+            Self::Aggregated(aggregated) => {
+                // we do not need to do anything for aggregated
+                // but return true is helpful to stop the outer loop early
+                if aggregated.commit_proof.commit_info() == target_commit_info {
+                    return Ok(());
+                }
+            }
+        }
+        Err(anyhow!("Inconsistent commit info."))
+    }
+
+    pub fn is_ordered(&self) -> bool {
+        matches!(self, Self::Ordered(_))
+    }
+
+    pub fn is_executed(&self) -> bool {
+        matches!(self, Self::Executed(_))
+    }
+
+    pub fn is_signed(&self) -> bool {
+        matches!(self, Self::Signed(_))
+    }
+
+    pub fn is_aggregated(&self) -> bool {
+        matches!(self, Self::Aggregated(_))
+    }
+
+    pub fn unwrap_signed_mut(&mut self) -> &mut SignedItem {
+        match self {
+            BufferItem::Signed(item) => item.as_mut(),
+            _ => panic!("Not signed item"),
+        }
+    }
+
+    pub fn unwrap_executed_ref(&self) -> &ExecutedItem {
+        match self {
+            BufferItem::Executed(item) => item.as_ref(),
+            _ => panic!("Not executed item"),
+        }
+    }
+
+    pub fn unwrap_aggregated(self) -> AggregatedItem {
+        match self {
+            BufferItem::Aggregated(item) => *item,
+            _ => panic!("Not aggregated item"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::executed_commit_timestamp_usecs;
+
+    #[test]
+    fn executed_commit_timestamp_preserves_legacy_block_timestamp_before_alpha() {
+        assert_eq!(executed_commit_timestamp_usecs(1_000, 2_000, false), 2_000);
+    }
+
+    #[test]
+    fn executed_commit_timestamp_uses_corrected_commit_timestamp_after_alpha() {
+        assert_eq!(executed_commit_timestamp_usecs(1_000, 2_000, true), 1_000);
+    }
+}

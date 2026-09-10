@@ -1,0 +1,245 @@
+// Copyright © Aptos Foundation
+// Parts of the project are originally copyright © Meta Platforms, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+use laptos::{
+    api_types::compute_res::{ComputeRes, TxnStatus},
+    aptos_crypto::hash::{HashValue, ACCUMULATOR_PLACEHOLDER_HASH},
+    aptos_types::{
+        block_executor::{config::BlockExecutorConfigFromOnchain, partitioner::ExecutableBlock},
+        contract_event::ContractEvent,
+        epoch_state::EpochState,
+        ledger_info::LedgerInfoWithSignatures,
+        transaction::{block_epilogue::BlockEndInfo, Transaction},
+    },
+};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Display, sync::Arc};
+use thiserror::Error;
+
+#[derive(Debug, Deserialize, Error, PartialEq, Eq, Serialize)]
+/// Different reasons for proposal rejection
+pub enum ExecutorError {
+    #[error("Cannot find speculation result for block id {0}")]
+    BlockNotFound(HashValue),
+
+    #[error("Cannot get data for batch id {0}")]
+    DataNotFound(HashValue),
+
+    #[error(
+        "Bad num_txns_to_commit. first version {}, num to commit: {}, target version: {}",
+        first_version,
+        to_commit,
+        target_version
+    )]
+    BadNumTxnsToCommit { first_version: Version, to_commit: usize, target_version: Version },
+
+    #[error("Internal error: {:?}", error)]
+    InternalError { error: String },
+
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+
+    #[error("Received Empty Blocks")]
+    EmptyBlocks,
+
+    #[error("Could Not Get Data")]
+    CouldNotGetData,
+}
+
+pub type Version = u64;
+
+impl ExecutorError {
+    pub fn internal_err<E: Display>(e: E) -> Self {
+        Self::InternalError { error: format!("{}", e) }
+    }
+}
+
+pub type ExecutorResult<T> = Result<T, ExecutorError>;
+
+#[derive(Clone, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")] // cannot use tag = "type" as nested enums cannot work, and bcs doesn't support it
+pub enum BlockGasLimitType {
+    NoLimit,
+    Limit(u64),
+}
+
+pub trait BlockExecutorTrait: Send + Sync {
+    /// Get the latest committed block id
+    fn committed_block_id(&self) -> HashValue;
+
+    /// Reset the internal state including cache with newly fetched latest committed block from
+    /// storage.
+    fn reset(&self) -> anyhow::Result<()>;
+
+    /// Executes a block and returns the state checkpoint output.
+    fn execute_and_state_checkpoint(
+        &self,
+        block: ExecutableBlock,
+        parent_block_id: HashValue,
+        onchain_config: BlockExecutorConfigFromOnchain,
+    ) -> ExecutorResult<()>;
+
+    fn ledger_update(
+        &self,
+        block_id: HashValue,
+        parent_block_id: HashValue,
+    ) -> ExecutorResult<StateComputeResult>;
+
+    fn commit_blocks(
+        &self,
+        block_ids: Vec<HashValue>,
+        ledger_info_with_sigs: LedgerInfoWithSignatures,
+    ) -> ExecutorResult<()> {
+        for block_id in &block_ids {
+            self.pre_commit_block(block_id.clone())?;
+        }
+        self.commit_ledger(
+            block_ids.into_iter().map(|id| (id, 0)).collect(),
+            ledger_info_with_sigs,
+            vec![],
+        )
+    }
+
+    fn pre_commit_block(&self, block_id: HashValue) -> ExecutorResult<()>;
+
+    fn commit_ledger(
+        &self,
+        block_ids: Vec<(HashValue, u64)>,
+        ledger_info_with_sigs: LedgerInfoWithSignatures,
+        randomness_data: Vec<(u64, Vec<u8>)>,
+    ) -> ExecutorResult<()>;
+
+    /// Finishes the block executor by releasing memory held by inner data structures(SMT).
+    fn finish(&self);
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StateComputeResult {
+    pub execution_output: ComputeRes,
+    epoch_state: Option<EpochState>,
+    block_end_info: Option<BlockEndInfo>,
+}
+
+impl StateComputeResult {
+    pub fn new(
+        execution_output: ComputeRes,
+        epoch_state: Option<EpochState>,
+        block_end_info: Option<BlockEndInfo>,
+    ) -> Self {
+        Self { execution_output, epoch_state, block_end_info }
+    }
+
+    pub fn version(&self) -> Version {
+        // TODO(liquent_byteyue): this is a placeholder, we should return the real version
+        Version::from(0u8)
+    }
+
+    pub fn new_dummy() -> Self {
+        StateComputeResult::with_root_hash(*ACCUMULATOR_PLACEHOLDER_HASH)
+    }
+
+    /// Like `new_dummy`, but carries an epoch_state so `has_reconfiguration()` returns true.
+    /// Used for suffix blocks after an epoch change: they have no real execution output,
+    /// but must still be tagged as reconfiguration-suffix for the consensus pipeline to
+    /// treat them as part of the epoch transition.
+    pub fn new_dummy_with_epoch_state(epoch_state: EpochState) -> Self {
+        let mut res = Self::new_dummy();
+        res.epoch_state = Some(epoch_state);
+        res
+    }
+
+    /// generate a new dummy state compute result with a given root hash.
+    /// this function is used in RandomComputeResultStateComputer to assert that the compute
+    /// function is really called.
+    pub fn with_root_hash(root_hash: HashValue) -> Self {
+        Self {
+            execution_output: ComputeRes {
+                data: root_hash.to_vec().try_into().unwrap(),
+                txn_num: 0,
+                txn_status: Arc::new(None),
+                events: vec![],
+            },
+            epoch_state: None,
+            block_end_info: None,
+        }
+    }
+
+    pub fn root_hash(&self) -> HashValue {
+        HashValue::new(self.execution_output.data)
+    }
+
+    pub fn epoch_state(&self) -> &Option<EpochState> {
+        &self.epoch_state
+    }
+
+    pub fn has_reconfiguration(&self) -> bool {
+        self.epoch_state.is_some()
+    }
+
+    pub fn txn_status(&self) -> Arc<Option<Vec<TxnStatus>>> {
+        self.execution_output.txn_status.clone()
+    }
+
+    /// This function only returns the user transactions for the mempool to do gc
+    pub fn transactions_to_commit(&self, input_txns: Vec<Transaction>) -> Vec<Transaction> {
+        let txn_status = self.execution_output.txn_status.clone();
+        let status_len = match txn_status.as_ref() {
+            Some(status) => status.len(),
+            None => return input_txns,
+        };
+        if status_len != input_txns.len() {
+            eprintln!(
+                "WARNING: transactions_to_commit: txn_status length ({}) != input_txns length ({}), \
+                 trailing transactions will be silently dropped",
+                status_len,
+                input_txns.len()
+            );
+        }
+        let status = txn_status.as_ref().as_ref().unwrap();
+        // for the corresponding status, if it is discarded, then remove the txn from the input_txns
+        input_txns
+            .into_iter()
+            .zip(status.iter())
+            .filter(|(_, status)| !status.is_discarded)
+            .map(|(txn, _)| txn)
+            .collect()
+    }
+
+    pub fn events(&self) -> Vec<ContractEvent> {
+        self.execution_output
+            .events
+            .iter()
+            .filter_map(|event| match ContractEvent::try_from(event) {
+                Ok(contract_event) => Some(contract_event),
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: StateComputeResult::events: skipping malformed event: {}",
+                        e
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+impl From<anyhow::Error> for ExecutorError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::InternalError { error: format!("{}", error) }
+    }
+}
+
+pub mod state_checkpoint_output {
+    use std::marker::PhantomData;
+
+    #[derive(Default)]
+    pub struct StateCheckpointOutput {}
+
+    pub struct BlockExecutorInner<V> {
+        phantom: PhantomData<V>,
+    }
+}
+
+#[cfg(test)]
+mod tests {}

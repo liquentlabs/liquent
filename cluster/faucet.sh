@@ -1,0 +1,212 @@
+#!/bin/bash
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${1:-$SCRIPT_DIR/cluster.toml}"
+OUTPUT_DIR="${LIQUENT_ARTIFACTS_DIR:-$SCRIPT_DIR/output}"
+
+source "$SCRIPT_DIR/utils/common.sh"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+main() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log_error "Config file not found: $CONFIG_FILE"
+        exit 1
+    fi
+    export CONFIG_FILE
+    
+    # Parse TOML
+    config_json=$(parse_toml)
+    
+    # Check if faucet enabled
+    num_accounts=$(echo "$config_json" | jq -r '.faucet_init.num_accounts // 0')
+    
+    if [ "$num_accounts" -le 0 ]; then
+        log_info "No faucet accounts requested (faucet_init.num_accounts <= 0). Skipping."
+        exit 0
+    fi
+    
+    log_info "Initializing $num_accounts faucet accounts..."
+    
+    # Extract Node Config
+    nodes=$(echo "$config_json" | jq -r '.nodes')
+    if [ "$nodes" == "null" ] || [ $(echo "$nodes" | jq 'length') -eq 0 ]; then
+        log_error "No nodes found in config"
+        exit 1
+    fi
+    
+    # Use first node
+    rpc_host=$(echo "$nodes" | jq -r '.[0].host // "127.0.0.1"')
+    rpc_port=$(echo "$nodes" | jq -r '.[0].rpc_port // 8545')
+    rpc_url="http://$rpc_host:$rpc_port"
+    
+    # Extract faucet config
+    private_key=$(echo "$config_json" | jq -r '.faucet_init.private_key // "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"')
+    eth_balance_per_acc=$(echo "$config_json" | jq -r '.faucet_init.eth_balance // "1000000000000000000"')
+    
+    # Calculate total required balance (num_accounts * per_acc + buffer for gas)
+    # Gas overhead ~ 0.003 ETH per account in worst case (deep tree)? 
+    # Let's add 0.01 ETH per account as buffer to be safe, plus fixed buffer.
+    # actually, liquent_bench subtracts (total_txns * gas_price).
+    # gas_price is hardcoded to 0.0021 ETH.
+    # total_txns approx 1.1 * num_accounts.
+    # So overhead is approx 1.1 * 0.0021 * num_accounts ~= 0.00231 * num_accounts.
+    # We'll use python for big int math.
+    
+    faucet_eth_balance=$(python3 -c "
+num = $num_accounts
+per_acc = int('$eth_balance_per_acc')
+# Buffer: 0.01 ETH (10^16) per account for gas
+buffer_per_acc = 10**16 
+total = num * (per_acc + buffer_per_acc)
+print(total)
+")
+    
+    # Chain ID (try to read from genesis.json in artifacts)
+    chain_id=""
+    if [ -f "$OUTPUT_DIR/genesis.json" ]; then
+        genesis_chain_id=$(jq -r '.config.chainId // empty' "$OUTPUT_DIR/genesis.json")
+        if [ ! -z "$genesis_chain_id" ]; then
+            chain_id=$genesis_chain_id
+        fi
+    fi
+
+    if [ -z "$chain_id" ]; then
+        log_error "Could not determine chain_id from artifacts/genesis.json. Cannot generate faucet config."
+        exit 1
+    fi
+
+    # Prepare Liquent Bench
+    LIQUENT_BENCH_DIR="$PROJECT_ROOT/external/liquent_bench"
+    
+    # Check dependencies in config
+    bench_repo=$(echo "$config_json" | jq -r '.dependencies.liquent_bench.repo // "https://github.com/liquentlabs/liquent_bench.git"')
+    bench_ref=$(echo "$config_json" | jq -r '.dependencies.liquent_bench.ref // "main"')
+
+    if [ ! -d "$LIQUENT_BENCH_DIR" ]; then
+        log_info "liquent_bench not found. Cloning from $bench_repo..."
+        mkdir -p "$(dirname "$LIQUENT_BENCH_DIR")"
+        git clone "$bench_repo" "$LIQUENT_BENCH_DIR"
+    fi
+
+    # Always fetch + checkout + pull to ensure latest code
+    (
+        cd "$LIQUENT_BENCH_DIR"
+        log_info "Checking out liquent_bench ref: $bench_ref..."
+        git fetch origin
+        git checkout "$bench_ref"
+        # Pull latest if on a branch (no-op for detached HEAD / commit hash)
+        if git symbolic-ref -q HEAD &>/dev/null; then
+            log_info "Pulling latest changes for branch $bench_ref..."
+            git pull origin "$bench_ref"
+        fi
+
+        log_info "Initializing submodules..."
+        git submodule update --init --recursive
+
+        # Install python dependencies for deploy.py if needed
+        if [ -f "requirements.txt" ]; then
+             log_info "Installing liquent_bench requirements..."
+             pip install -r requirements.txt || true
+        fi
+    )
+    
+    # Ensure liquent_bench is set up (contracts cloned, etc.)
+    if [ -f "$LIQUENT_BENCH_DIR/setup.sh" ]; then
+        log_info "Running liquent_bench setup.sh..."
+        (
+            cd "$LIQUENT_BENCH_DIR"
+            # setup.sh expects to be run in its dir
+            bash setup.sh
+        )
+    else
+        log_warn "setup.sh not found in liquent_bench. Manual setup might be required."
+    fi
+    
+    # Generate bench config
+    bench_config_path="$OUTPUT_DIR/faucet_bench_config.toml"
+    accounts_csv="$OUTPUT_DIR/accounts.csv"
+    contracts_json="$OUTPUT_DIR/contracts.json" # Dummy path, deploy.py will create/overwrite
+    log_path="$OUTPUT_DIR/faucet_bench.log"
+    
+    cat > "$bench_config_path" <<EOF
+contract_config_path = "$contracts_json"
+log_path = "console"
+num_tokens = 0
+target_tps = $(( num_accounts < 10000 ? num_accounts : 10000 ))
+enable_swap_token = false
+address_pool_type = "random"
+
+[[nodes]]
+rpc_url = "$rpc_url"
+chain_id = $chain_id
+
+[faucet]
+private_key = "$private_key"
+faucet_level = 10
+wait_duration_secs = 1
+faucet_eth_balance = "$faucet_eth_balance"
+# Keep the historical typo for compatibility with older liquent_bench builds.
+fauce_eth_balance = "$faucet_eth_balance"
+
+[accounts]
+num_accounts = $num_accounts
+
+[performance]
+num_senders = 100
+max_pool_size = 10000
+duration_secs = 0
+EOF
+
+    log_info "Generated bench config at $bench_config_path"
+    
+    # Build first (NOT under timeout: cold-cache compile can legitimately take minutes).
+    log_info "Building liquent_bench (release)..."
+    ( cd "$LIQUENT_BENCH_DIR" && cargo build --release --quiet --bin liquent_bench )
+
+    # Resolve the binary path via cargo metadata; workspace target_directory may
+    # not be $LIQUENT_BENCH_DIR/target.
+    target_dir=$(
+        cd "$LIQUENT_BENCH_DIR" && \
+        cargo metadata --format-version 1 --no-deps \
+        | python3 -c 'import sys, json; print(json.load(sys.stdin)["target_directory"])'
+    )
+    bin_path="$target_dir/release/liquent_bench"
+
+    # Run under timeout(1) when available; macOS does not ship GNU timeout.
+    # Only the execution phase is bounded so cold-cache builds can take longer.
+    # CWD must be $LIQUENT_BENCH_DIR: the binary resolves "scripts/deploy.py"
+    # and other resources relative to its working directory.
+    timeout_secs="${FAUCET_RUN_TIMEOUT_SECS:-600}"
+    timeout_cmd=()
+    if command -v timeout >/dev/null 2>&1; then
+        timeout_cmd=(timeout --signal=TERM --kill-after=10 "${timeout_secs}s")
+        log_info "Running liquent_bench (timeout=${timeout_secs}s)..."
+    else
+        log_warn "timeout command not found; running liquent_bench without outer timeout"
+        log_info "Running liquent_bench..."
+    fi
+    set +e
+    (
+        cd "$LIQUENT_BENCH_DIR" && \
+        "${timeout_cmd[@]}" \
+            "$bin_path" \
+                --config "$bench_config_path" \
+                --faucet-only \
+                --accounts-output "$accounts_csv"
+    )
+    rc=$?
+    set -e
+
+    if [ "$rc" -eq 124 ]; then
+        log_error "Faucet run timed out after ${timeout_secs}s"
+        exit 124
+    elif [ "$rc" -ne 0 ]; then
+        log_error "liquent_bench failed (rc=$rc)"
+        exit 1
+    fi
+
+    log_info "Faucet init complete. Accounts saved to $accounts_csv"
+}
+
+main "$@"
